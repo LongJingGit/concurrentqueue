@@ -77,6 +77,7 @@
 #include <climits> // for CHAR_BIT
 #include <array>
 #include <thread> // partly for __WINPTHREADS_VERSION if on MinGW-w64 w/ POSIX threading
+#include <iostream>
 
 // Platform-specific definitions of a numeric thread ID type and an invalid value
 namespace moodycamel
@@ -431,6 +432,11 @@ namespace moodycamel
         // prevent a race condition no matter the usage of the queue. Note that
         // whether the queue is lock-free with a 64-int type depends on the whether
         // std::atomic<std::uint64_t> is lock-free, which is platform-specific.
+        /* *
+         * 这个类型被用作入队和出队的索引。至少要和 size_t 一样大
+         * 如果你希望队列有一个很大的吞吐量，则需要将这个值设置的比队列的容量大得多
+         * 注意，64-int类型的队列是否无锁取决于std::atomic<std::uint64_t>是否无锁，这是特定于平台的
+         * */
         typedef std::size_t index_t;
 
         // Internally, all elements are enqueued and dequeued from multi-element
@@ -438,6 +444,11 @@ namespace moodycamel
         // but many producers, a smaller block size should be favoured. For few producers
         // and/or many elements, a larger block size is preferred. A sane default
         // is provided. Must be a power of 2.
+        /* *
+         * 每个 producer 都有一个 SPMC 队列，每个队列用由多个 block 组成。
+         * 如果元素少而 producer 多，则可以将 block 的大小设置小一些
+         * 如果 producer 少但是元素多，可以将 block 的大小调大
+         * */
         static const size_t BLOCK_SIZE = 32;
 
         // For explicit producers (i.e. when using a producer token), the block is
@@ -445,37 +456,60 @@ namespace moodycamel
         // For large block sizes, this is too inefficient, and switching to an atomic
         // counter-based approach is faster. The switch is made for block sizes strictly
         // larger than this threshold.
+        /* *
+         * 检查 block 是否为空的阈值：
+         * 如果 block size 小于这个阈值，则通过遍历每一个元素的 flag 来判断是否 block 为空
+         * 如果大于这个阈值,则使用基于 atomic 的计数器来判断
+         * */
         static const size_t EXPLICIT_BLOCK_EMPTY_COUNTER_THRESHOLD = 32;
 
         // How many full blocks can be expected for a single explicit producer? This should
         // reflect that number's maximum for optimal performance. Must be a power of 2.
+        // 一个显式生产者可以有多少完整的块。这是能够发挥最佳性能的最大数值
         static const size_t EXPLICIT_INITIAL_INDEX_SIZE = 32;
 
         // How many full blocks can be expected for a single implicit producer? This should
         // reflect that number's maximum for optimal performance. Must be a power of 2.
+        // 一个隐式生产者最多可以拥有的 block 的数量
+        // 隐式生产者用循环缓冲区来管理 block index（缓冲区的每个元素都是一个指向 block 的索引），所以也可以理解成一个隐式生产者的循环缓冲区的大小
         static const size_t IMPLICIT_INITIAL_INDEX_SIZE = 32;
 
         // The initial size of the hash table mapping thread IDs to implicit producers.
         // Note that the hash is resized every time it becomes half full.
         // Must be a power of two, and either 0 or at least 1. If 0, implicit production
         // (using the enqueue methods without an explicit producer token) is disabled.
+        // hash 表的初始大小（将线程 ID 映射到 隐式生产者队列的 hash 表）
+        // 每次哈希表为半满时将会调整哈希表的大小
+        // 必须是2的倍数，至少是0或者1
+        // 如果是0，则禁用隐式生产者
+        // 隐式生产者使用队列方法而不是用显示的生产者令牌
         static const size_t INITIAL_IMPLICIT_PRODUCER_HASH_SIZE = 32;
 
         // Controls the number of items that an explicit consumer (i.e. one with a token)
         // must consume before it causes all consumers to rotate and move on to the next
         // internal queue.
+        // 控制显式消费者（即带有令牌的消费者）在导致所有消费者旋转并移动到下一个内部队列之前必须消费的数量
         static const std::uint32_t EXPLICIT_CONSUMER_CONSUMPTION_QUOTA_BEFORE_ROTATE = 256;
 
         // The maximum number of elements (inclusive) that can be enqueued to a sub-queue.
         // Enqueue operations that would cause this limit to be surpassed will fail. Note
         // that this limit is enforced at the block level (for performance reasons), i.e.
         // it's rounded up to the nearest block size.
+        /*
+         * 子队列中可以容纳的最大数量
+         * 超过此限制的队列操作将失败
+         * 注意，这个限制是在块级别执行的(出于性能原因)，也就是说，它被舍入到最接近的块大小。
+         **/
         static const size_t MAX_SUBQUEUE_SIZE = details::const_numeric_max<size_t>::value;
 
         // The number of times to spin before sleeping when waiting on a semaphore.
         // Recommended values are on the order of 1000-10000 unless the number of
         // consumer threads exceeds the number of idle cores (in which case try 0-100).
         // Only affects instances of the BlockingConcurrentQueue.
+        /* 等待信号量时自旋的次数
+         * 建议的值是1000-10000，除非消费线程的数量超过空闲核的数量(在这种情况下尝试0-100)。
+         * 仅影响 BlockingConcurrentQueue 实例
+         * */
         static const int MAX_SEMA_SPINS = 10000;
 
 #ifndef MCDBGQ_USE_RELACY
@@ -925,6 +959,111 @@ namespace moodycamel
     template <typename T, typename Traits>
     inline void swap(typename ConcurrentQueue<T, Traits>::ImplicitProducerKVP &a, typename ConcurrentQueue<T, Traits>::ImplicitProducerKVP &b) MOODYCAMEL_NOEXCEPT;
 
+    /* design:
+     * 每个生产者都需要一些线程本地数据，线程本地数据也可以用来提高消费者的速度。
+     * 线程本地数据可以与用户分配的令牌相关联，
+     * 如果用户没有为生产者提供令牌，则使用一个无锁哈希表(键值为当前线程ID)来查找线程本地生产者队列，
+     * 为每个显式分配的生产者令牌创建一个显式队列，并为生产者而不提供令牌的每个线程创建另一个隐式队列。
+     * 由于令牌包含的数据相当于特定于线程的数据，因此不应该在多个线程中同时使用它们(尽管可以将令牌的所有权转移到另一个线程; 特别是，这允许在线程池任务中使用令牌，即使运行任务的线程中途发生了更改)。
+     *
+     * 所有的生产者队列都将自己链接到一个无锁链表中。当一个显示生产者不再需要添加元素时（即它的令牌被销毁），它会被标记为与任何生产者无关，但是它仍然被保存在列表中，并不会进行内存释放。下一个新的生产者将
+     * 重用旧的生产者内存（无锁生产者列表只能通过这种方式增加）。隐式生产者永远不会被销毁（直到高级队列本身被销毁），因为无法知道是否有线程正在使用数据结构。
+     * 注意，最坏的情况下，退出队列的速度取决于有多少生产者队列，即时他们都是空的
+     *
+     * 显式队列和隐式队列的生命周期的根本区别在于：显式队列的生命周期和令牌的生命周期相关联；隐式队列的生命周期和高级队列的生命周期相关联
+     * 使用了两种略有不同的 SPMC 算法，以最大化速度和内存使用量。
+     * 显式生产者队列设计的稍微快一些，内存占用稍微大一些；隐式生产者队列设计的稍微慢一些，但是会将更多的内存回收到高级队列的内存池中
+     *
+     * 任何分配到的内存只有在高级队列被销毁时才会被释放。内存分配可以提前完成，如果没有足够的内存，操作就会失败。各种默认大小参数以及队列使用的内存分配函数可以由用户重写
+     * **/
+
+    /* 显示队列和隐式队列的共享设计：
+     * 1. 生产者队列由 block 组成，可以抽象认为是一个无限数组，有很多 slot。维护着两个变量：tail index 和 head index
+     *    1.1 tail index 表示下一个即将入队的 slot。tail index 总是增加（除非溢出或者环绕）。入队操作只有一个线程在更新对应的变量
+     *    1.2 head index 即将出队的 slot。出队操作可能是并发的，由多个消费者进行原子性的递增。
+     * 2.tail 和 head 的索引计数最终会溢出（预期之内的）
+     */
+
+    /* block pool design:
+     * 这里使用了两个不同的块池:
+     *   1. 首先，有预分配块的初始数组。一旦消耗殆尽，这个池子将永远空着。简化了无等待的实现， fetch-and-add（获取空闲块的下一个索引）和检查(确保该索引在范围内)
+     *   2. 其次，有一个 lock-free 的全局 free-list（这里的全局指的是对高级队列的全局）。它是 lock-free 的，但不是 wait-free 的。
+     *      free-list 元素是一些准备被重用的已用 block。具体实现是一个 lock-free 的单链表，头指针初始化为 null。
+     * free-list 的 add 操作：block 的 next 指针被设置为 头指针，然后头指针在头没有改变的情况下使用 CAS 操作更新为指向 block，
+     * free-list 的 remove 操作：读取 head block 的 next 指针，然后将 head 设置为 next（使用 CAS），前提条件是 head 在此期间没有发生改变。
+     *
+     * free-list 避免 ABA 问题：https://moodycamel.com/blog/2014/solving-the-aba-problem-for-lock-free-free-lists.htm
+     */
+
+    /* 隐式队列的设计：
+     * 隐式生产者队列的实现是一组没有连接的 blocks（set）.
+     * 它是 lock-free 的，但不是 wait-free 的。因为 free-list 是无锁的，隐式生产者队列不断地从 free-list 中获取 block 或者将 block 插入到 free-list 中。
+     *
+     * 在单个 block 中入队和出队操作仍然是 wait-free 的
+     *
+     * 维护着一个指向当前 block 的指针，这个 block 是当前正在入队的 block。
+     *
+     * 当 block 被填满时，需要获取一个新的 block，从生产者的角度看，旧的 block 就会被遗忘。
+     * 在将元素添加到 block 之前，需要先将 block 插入到 block index 中（这允许消费者找到生产者已经遗忘的 block）。
+     * 当 block 中的最后一个 元素被消费时，需要将 block 从 block index 中删除
+     *
+     * 隐式生产者队列永远不会被重用，一旦创建，它将贯穿高级队列的整个生命周期。因此，为了减少内存消耗，它不是占用它曾经使用过的所有 block (像显式生产者队列)，
+     * 而是将使用过的 block 返回给全局 free-list。为了做到这一点，一旦消费者完成了一个项目的离队，每个 block 中的原子离队计数就会增加; 当计数器达到 block 的大小时，
+     * 看到它的消费者知道它刚刚将最后一项退出队列，并将 block 放入 free-list。
+     *
+     * 隐式生产者队列使用一个循环缓冲区来实现它的 block 索引，可以在常数时间内进行搜索。每个索引项由表示 block 的基索引的键-值对和指向相应 block 本身的指针组成。
+     * 由于 block 总是按顺序插入，索引中每个 block 的基索引保证在相邻的项之间恰好增加一个 block 大小的值。这意味着，通过查看最后插入的基索引，计算所需基索引的偏移量，
+     * 并在该偏移量上查找索引项，可以很容易地找到已知在索引中的任何 block。
+     * 需要特别注意，以确保当 block 索引换行时，算法仍然有效(尽管假设在任何给定时刻，相同的基本索引不会出现(或看起来出现)两次在索引中)。
+     *
+     * 当一个 block 被用完时，它会从索引中移除(为以后的 block 插入腾出空间); 由于另一个消费者可能仍然在使用索引中的那个条目(计算偏移量)，索引条目没有被完全删除，但是 block 指针被设置为空，
+     * 这向生产者表明 slot 可以被重用; 对于任何仍在使用它来计算偏移量的消费者，block 基是不受影响的。 因为生产者只有在所有之前的插槽都是空闲的时候才会重新使用一个插槽，
+     * 而当消费者在索引中查找一个 block 时，索引中必须至少有一个非空闲的插槽(对应于它正在查找的 block)，而且消费者用来查找 block 的 block 索引条目至少和那个块的块索引条目一样，
+     * 在生产者重用一个槽和消费者使用那个槽查找块之间不会有竞争条件。
+     *
+     * 当消费者想要将一个条目放入队列中时，如果 block 索引中没有空间了，它(如果允许的话)会分配另一个 block 索引(链接到旧的 block 索引，以便在队列被破坏时最终释放它的内存)，
+     * 从那时起它就成为主索引。新索引是旧索引的副本，只是大小是旧索引的两倍; 复制所有索引项允许消费者只需要在一个索引中查找他们要查找的块(在一个块中定时退出队列)。
+     * 由于在构造新索引时，消费者可能正在将索引项标记为空闲(通过将块指针设置为空)，因此索引项本身不会被复制，而是指向它们的指针。 这确保消费者对旧索引的任何更改也会正确地影响当前索引。
+     */
+
+    /* 显示队列的设计：
+     * 显示队列是一个 block 的环状链表。在快速路径是 wait-free 的，但是当需要从 block pool 中获取快或者分配新的 block 时，
+     * 它只是 lock-free 的。这种情况发生在内部缓存的 block 都满了，或者一开始的情况。
+     *
+     * 一旦一个 block 被添加到显示生产者队列的循环链表中，它将永远不会被删除。
+     *
+     * tail block 指针由生产者维护，它指向当前要插入的元素的 block；当 tail block 填满时，将检查下一个 block 是否为空。如果是空的，则将 tail block 指向该 block;
+     * 否则申请一个新的 block 并将其插入到循环链表的尾部，然后更新 tail block 指向这个新的 block。
+     *
+     * 当一个元素从完全从 block 中退出时，就设置标志表示这个 slot 为 emtpy。生产者通过检查这些标志来判断 block 是否为空。
+     * 如果 BLOCK_SIZE 很小，可以通过检查标志的方式来判断 block 是否为空；如果 BLOCK_SIZE 很大，则需要通过原子计数来判断。
+     *
+     * 为了在常数时间内对 block 进行索引，这里使用了一个 循环的缓冲区（环状数组）。索引由生产者进行维护，消费者可以读取但是不能写入。
+     */
+
+    /* 隐式生产者队列的 hash 设计:
+     * 无锁哈希表用于将线程id映射到隐式生产者; 当没有为各种入队方法提供显式生产者令牌时，使用此方法。
+     * 它基于Jeff Preshing的无锁散列算法进行了一些调整：key 的大小与依赖于平台的线程 ID 类型相同; value 是指针;
+     * 当哈希值变得太小(使用原子计数器跟踪元素的数量)时，就会分配一个新的哈希值，并将其链接到旧哈希值，旧哈希值中的元素在读取时被延迟传输。由于原子数的数量元素可用,和元素永远不会删除,
+     * 一个线程希望哈希表中插入一个元素太小必须尝试调整或等待另一个线程来完成调整(调整保护锁,防止虚假的分配)。为了加快调整下争用(即最小化的spin-waiting线程等待另一个线程完成分配),
+     * 物品可以插入老哈希表到一个阈值显著大于阈值触发调整(如负荷系数为0.5会开始调整, 与此同时，可以将元件插入到旧的元件中，负载系数可以达到0.75)。
+     */
+
+    /* 生产者链表：
+     * 维护着一个由所有生产者组成的单链表。这个链表维护着两个指针：tail 和 next (实际上是 prev)。
+     * 尾指针最初指向为Null，当创建一个新的生产者时，它将自己添加到链表中，首先读取尾部，然后在尾部旁边设置它，然后使用CAS操作将尾部(如果它没有改变)设置为新的生产者(必要时循环)。
+     *  生产者永远不会从列表中删除，但可以标记为非活动的。
+     *
+     * 当消费者想要将一个项目从队列中取出时，它只需遍历生产者列表，以查找其中有一个项目的SPMC队列(由于生产者的数量是无限的，这在一定程度上使得高级队列只是无锁而不是无等待)。
+     */
+
+    /* 消费者可以将一个令牌传递给各种出队方法。此令牌的目的是加快选择适当的内部生产者队列，以便试图从中退出队列。
+     * 使用了一个简单的方案，为每个显式消费者分配一个自动递增的偏移量，表示生产者队列的索引，它应该退出队列。以这种方式，消费者在生产者之间尽可能公平地分配;
+     * 然而，并非所有生产者拥有相同数量的可用元素，有些消费者可能比其他人消费得更快; 为了解决这个问题，第一个消费来自同一内部生产者队列的一行中256个条目的消费者将增加一个全局偏移量，
+     * 导致所有消费者在他们的下一个出队列操作上旋转，并开始从下一个生产者消费。 (注意，这意味着旋转速度是由最快的消费者决定的。) 如果消费者指定的队列中没有可用的元素，它就移到下一个有
+     * 可用元素的队列中。 这个简单的启发式是有效的，并且能够以近乎完美的规模将消费者与生产者配对，从而带来令人印象深刻的退出队列速度提升。
+     */
+
     template <typename T, typename Traits = ConcurrentQueueDefaultTraits>
     class ConcurrentQueue
     {
@@ -972,6 +1111,11 @@ namespace moodycamel
         // queue is fully constructed before it starts being used by other threads (this
         // includes making the memory effects of construction visible, possibly with a
         // memory barrier).
+        /*
+         * 注意，在不分配额外内存的情况下可以插入的元素的实际数量取决于生产者的数量和块的大小。
+         * 如果块的大小等于 capacity，则会预先只分配一个 block。这意味着只能有一个生产者能够在不额外分配内存的情况下将元素放入队列，并且 block 不会在生产者之间共享
+         * 不是线程安全的。在队列被其他线程使用之前，用户要确保队列已经完全构造好（包括使构造的内存可见，可能使用内存屏障）
+         */
         explicit ConcurrentQueue(size_t capacity = 6 * BLOCK_SIZE)
             : producerListTail(nullptr),
               producerCount(0),
@@ -1656,9 +1800,19 @@ namespace moodycamel
         template <typename N> // N must inherit FreeListNode or have the same fields (and initialization of them)
         struct FreeList
         {
-            FreeList() : freeListHead(nullptr) {}
-            FreeList(FreeList &&other) : freeListHead(other.freeListHead.load(std::memory_order_relaxed)) { other.freeListHead.store(nullptr, std::memory_order_relaxed); }
-            void swap(FreeList &other) { details::swap_relaxed(freeListHead, other.freeListHead); }
+            FreeList()
+                : freeListHead(nullptr) {}
+
+            FreeList(FreeList &&other)
+                : freeListHead(other.freeListHead.load(std::memory_order_relaxed))
+            {
+                other.freeListHead.store(nullptr, std::memory_order_relaxed);
+            }
+
+            void swap(FreeList &other)
+            {
+                details::swap_relaxed(freeListHead, other.freeListHead);
+            }
 
             FreeList(FreeList const &) MOODYCAMEL_DELETE_FUNCTION;
             FreeList &operator=(FreeList const &) MOODYCAMEL_DELETE_FUNCTION;
@@ -1722,7 +1876,10 @@ namespace moodycamel
             }
 
             // Useful for traversing the list when there's no contention (e.g. to destroy remaining nodes)
-            N *head_unsafe() const { return freeListHead.load(std::memory_order_relaxed); }
+            N *head_unsafe() const
+            {
+                return freeListHead.load(std::memory_order_relaxed);
+            }
 
         private:
             inline void add_knowing_refcount_is_zero(N *node)
@@ -1770,8 +1927,8 @@ namespace moodycamel
 
         enum InnerQueueContext
         {
-            implicit_context = 0,
-            explicit_context = 1
+            implicit_context = 0, // 隐式
+            explicit_context = 1  // 显式
         };
 
         struct Block
@@ -1787,6 +1944,7 @@ namespace moodycamel
             template <InnerQueueContext context>
             inline bool is_empty() const
             {
+                // 显式队列且小于阈值的时候，可以通过每个元素的 flag 标志来判断 block 是否为空
                 MOODYCAMEL_CONSTEXPR_IF(context == explicit_context && BLOCK_SIZE <= EXPLICIT_BLOCK_EMPTY_COUNTER_THRESHOLD)
                 {
                     // Check flags
@@ -1805,6 +1963,7 @@ namespace moodycamel
                 else
                 {
                     // Check counter
+                    // block 大小超过阈值，则需要根据原子变量来判断
                     if (elementsCompletelyDequeued.load(std::memory_order_relaxed) == BLOCK_SIZE)
                     {
                         std::atomic_thread_fence(std::memory_order_acquire);
@@ -1897,8 +2056,15 @@ namespace moodycamel
                 }
             }
 
-            inline T *operator[](index_t idx) MOODYCAMEL_NOEXCEPT { return static_cast<T *>(static_cast<void *>(elements)) + static_cast<size_t>(idx & static_cast<index_t>(BLOCK_SIZE - 1)); }
-            inline T const *operator[](index_t idx) const MOODYCAMEL_NOEXCEPT { return static_cast<T const *>(static_cast<void const *>(elements)) + static_cast<size_t>(idx & static_cast<index_t>(BLOCK_SIZE - 1)); }
+            inline T *operator[](index_t idx) MOODYCAMEL_NOEXCEPT
+            {
+                return static_cast<T *>(static_cast<void *>(elements)) + static_cast<size_t>(idx & static_cast<index_t>(BLOCK_SIZE - 1));
+            }
+
+            inline T const *operator[](index_t idx) const MOODYCAMEL_NOEXCEPT
+            {
+                return static_cast<T const *>(static_cast<void const *>(elements)) + static_cast<size_t>(idx & static_cast<index_t>(BLOCK_SIZE - 1));
+            }
 
         private:
             static_assert(std::alignment_of<T>::value <= sizeof(T), "The queue does not support types with an alignment greater than their size at this time");
@@ -1907,8 +2073,8 @@ namespace moodycamel
 
         public:
             Block *next;
-            std::atomic<size_t> elementsCompletelyDequeued;
-            std::atomic<bool> emptyFlags[BLOCK_SIZE <= EXPLICIT_BLOCK_EMPTY_COUNTER_THRESHOLD ? BLOCK_SIZE : 1];
+            std::atomic<size_t> elementsCompletelyDequeued;                                                      // block 是否为空
+            std::atomic<bool> emptyFlags[BLOCK_SIZE <= EXPLICIT_BLOCK_EMPTY_COUNTER_THRESHOLD ? BLOCK_SIZE : 1]; // block 中每个元素是否为空的标志位
 
         public:
             std::atomic<std::uint32_t> freeListRefs;
@@ -2009,13 +2175,14 @@ namespace moodycamel
 
         struct ExplicitProducer : public ProducerBase
         {
-            explicit ExplicitProducer(ConcurrentQueue *parent_) : ProducerBase(parent_, true),
-                                                                  blockIndex(nullptr),
-                                                                  pr_blockIndexSlotsUsed(0),
-                                                                  pr_blockIndexSize(EXPLICIT_INITIAL_INDEX_SIZE >> 1),
-                                                                  pr_blockIndexFront(0),
-                                                                  pr_blockIndexEntries(nullptr),
-                                                                  pr_blockIndexRaw(nullptr)
+            explicit ExplicitProducer(ConcurrentQueue *parent_)
+                : ProducerBase(parent_, true),
+                  blockIndex(nullptr),
+                  pr_blockIndexSlotsUsed(0),
+                  pr_blockIndexSize(EXPLICIT_INITIAL_INDEX_SIZE >> 1),
+                  pr_blockIndexFront(0),
+                  pr_blockIndexEntries(nullptr),
+                  pr_blockIndexRaw(nullptr)
             {
                 size_t poolBasedIndexSize = details::ceil_to_pow_2(parent_->initialBlockPoolSize) >> 1;
                 if (poolBasedIndexSize > pr_blockIndexSize)
@@ -2745,6 +2912,7 @@ namespace moodycamel
                                                          nextBlockIndexCapacity(IMPLICIT_INITIAL_INDEX_SIZE),
                                                          blockIndex(nullptr)
             {
+                // 创建 block index
                 new_block_index();
             }
 
@@ -2830,6 +2998,7 @@ namespace moodycamel
 #endif
                     // Find out where we'll be inserting this block in the block index
                     BlockIndexEntry *idxEntry;
+                    // 当 block index 用完时，允许 new 新的 block index（并和原来的 block index 连成链表）
                     if (!insert_block_index_entry<allocMode>(idxEntry, currentTailIndex))
                     {
                         return false;
@@ -3267,16 +3436,16 @@ namespace moodycamel
             struct BlockIndexEntry
             {
                 std::atomic<index_t> key;
-                std::atomic<Block *> value;
+                std::atomic<Block *> value; // 指向 block 的指针
             };
 
             struct BlockIndexHeader
             {
-                size_t capacity;
-                std::atomic<size_t> tail;
-                BlockIndexEntry *entries;
-                BlockIndexEntry **index;
-                BlockIndexHeader *prev;
+                size_t capacity;          // block index 的容量（实际上是 block index 中 entries 的数量，每一个 entry 都指向一个 block，每个 block 都有多个 slot，可以保存多个元素）
+                std::atomic<size_t> tail; // block index 中 entry 尾部（entry 是一个数组，随着 entry 数组中元素的的不断新增，该值会逐渐增大，并始终指向 entry 中最后一个新元素。类似于下标）
+                BlockIndexEntry *entries; // entries 可以看成一个数组，数组的每个元素都是 entry，每个 entry 是一个 KV 键值对，value 是 block 的指针
+                BlockIndexEntry **index;  // 指向 entries 的指针
+                BlockIndexHeader *prev;   // 多个 block index 会组成一个链表。该指针用来指向前一个 block index
             };
 
             template <AllocationMode allocMode>
@@ -3292,8 +3461,10 @@ namespace moodycamel
                 if (idxEntry->key.load(std::memory_order_relaxed) == INVALID_BLOCK_BASE ||
                     idxEntry->value.load(std::memory_order_relaxed) == nullptr)
                 {
-
+                    // 这里只更新了 entry 的 key 值，并没有更新 value（value 的更新是在该函数外部重新申请 block 并进行关联的）
                     idxEntry->key.store(blockStartIndex, std::memory_order_relaxed);
+                    // 更新 block index 的 entries 的 tail
+                    // 需要注意的是，当 block index 中的某一个 entry 的 block 填满之后，会去申请下一个 block，并和 block index 的下一个 entry 关联起来
                     localBlockIndex->tail.store(newTail, std::memory_order_release);
                     return true;
                 }
@@ -3303,6 +3474,7 @@ namespace moodycamel
                 {
                     return false;
                 }
+                // 当 block index 里的所有 entries 填满之后，会申请下一个 block index
                 else if (!new_block_index())
                 {
                     return false;
@@ -3350,6 +3522,8 @@ namespace moodycamel
             bool new_block_index()
             {
                 auto prev = blockIndex.load(std::memory_order_relaxed);
+                // 第二次创建 block index 时，prev 指针不为空
+                // prevCapacity: 上一次创建的 block index 的 capacity
                 size_t prevCapacity = prev == nullptr ? 0 : prev->capacity;
                 auto entryCount = prev == nullptr ? nextBlockIndexCapacity : prevCapacity;
                 auto raw = static_cast<char *>((Traits::malloc)(sizeof(BlockIndexHeader) +
@@ -3363,6 +3537,10 @@ namespace moodycamel
                 auto header = new (raw) BlockIndexHeader;
                 auto entries = reinterpret_cast<BlockIndexEntry *>(details::align_for<BlockIndexEntry>(raw + sizeof(BlockIndexHeader)));
                 auto index = reinterpret_cast<BlockIndexEntry **>(details::align_for<BlockIndexEntry *>(reinterpret_cast<char *>(entries) + sizeof(BlockIndexEntry) * entryCount));
+
+                // 非第一次创建 block index
+                // 把上一次创建的 block index 的 index 中的内容移动到这一次创建的 block index 里面的 index 部分
+                // TODO：只移动了 index 部分，entries 部分并未移动，这么做的目的是什么？？
                 if (prev != nullptr)
                 {
                     auto prevTail = prev->tail.load(std::memory_order_relaxed);
@@ -3375,12 +3553,17 @@ namespace moodycamel
                     } while (prevPos != prevTail);
                     assert(i == prevCapacity);
                 }
+
                 for (size_t i = 0; i != entryCount; ++i)
                 {
                     new (entries + i) BlockIndexEntry;
+                    // block entry 还没有连接具体的 block（只是设置了 key 值，value 才是 block）
                     entries[i].key.store(INVALID_BLOCK_BASE, std::memory_order_relaxed);
+                    // 注意这里做 index 和 entry 的指针映射：跳过了上一次创建的 block index 的 index 部分
+                    // （虽然将上一次创建的 block index 的 index 部分移动到了这一次创建的 block index 里面，但是指针指向关系没改变）
                     index[prevCapacity + i] = entries + i;
                 }
+
                 header->prev = prev;
                 header->entries = entries;
                 header->index = index;
@@ -3389,14 +3572,17 @@ namespace moodycamel
 
                 blockIndex.store(header, std::memory_order_release);
 
+                // 左移 *2
+                // 右移 /2
+                // 每次新创建 block index，其 capacity 为上一次创建 block index 的两倍
                 nextBlockIndexCapacity <<= 1;
 
                 return true;
             }
 
         private:
-            size_t nextBlockIndexCapacity;
-            std::atomic<BlockIndexHeader *> blockIndex;
+            size_t nextBlockIndexCapacity;              // 下一个 block index 的大小
+            std::atomic<BlockIndexHeader *> blockIndex; // 多个 block index 使用 prev 指针组成链表，new_block_index->prev = old_block_index
 
 #ifdef MOODYCAMEL_CPP11_THREAD_LOCAL_SUPPORTED
         public:
@@ -3656,6 +3842,10 @@ namespace moodycamel
             }
 
             recycled = false;
+            // 以下函数调用完成了三个功能：
+            // 1. creat producer 对象
+            // 2. 执行 隐式 producer 的构造函数，创建了新的 block index
+            // 3. 将 producer 添加到链表中
             return add_producer(isExplicit ? static_cast<ProducerBase *>(create<ExplicitProducer>(this)) : create<ImplicitProducer>(this));
         }
 
@@ -3715,6 +3905,9 @@ namespace moodycamel
 
         struct ImplicitProducerKVP
         {
+            // hash 表结构：
+            // key 是对应的生产者线程的线程id
+            // value 是对应的生产者 producer 对象指针
             std::atomic<details::thread_id_t> key;
             ImplicitProducer *value; // No need for atomicity since it's only read by the thread that sets it in the first place
 
@@ -3754,6 +3947,7 @@ namespace moodycamel
 
         inline void populate_initial_implicit_producer_hash()
         {
+            // 等于零表示禁用隐式生产者
             MOODYCAMEL_CONSTEXPR_IF(INITIAL_IMPLICIT_PRODUCER_HASH_SIZE == 0)
             {
                 return;
@@ -3831,6 +4025,7 @@ namespace moodycamel
 
             // Code and algorithm adapted from http://preshing.com/20130605/the-worlds-simplest-lock-free-hash-table
 
+            // 先在已有的 hash 表中找线程 ID，如果没有找到，说明还没有这样的生产者，因为所有的线程都会将自己的线程 ID 写入到 hash 表中
 #ifdef MCDBGQ_NOLOCKFREE_IMPLICITPRODHASH
             debug::DebugLock lock(implicitProdMutex);
 #endif
@@ -3856,7 +4051,11 @@ namespace moodycamel
                         // Note there's guaranteed to be room in the current hash table since every subsequent
                         // table implicitly reserves space for all previous tables (there's only one
                         // implicitProducerHashCount).
+                        // 根据线程 id 能够在 hash 表中找到对应的 producer，返回找到的 producer
                         auto value = hash->entries[index].value;
+
+                        // TODO: 以下 if 条件的代码是在做什么？
+                        // ans: 将非 mainHash 中的 KV 键值对（<thread_id, producer>）移动 mainHash 中（相当于 hash 的再散列？）
                         if (hash != mainHash)
                         {
                             index = hashedId;
@@ -3871,6 +4070,7 @@ namespace moodycamel
                                     (probedKey == reusable && mainHash->entries[index].key.compare_exchange_strong(reusable, id, std::memory_order_acquire, std::memory_order_acquire)))
                                 {
 #else
+                                // ans: 将非 mainHash 中的 KV 键值对（<thread_id, producer>）移动 mainHash 中
                                 if ((probedKey == empty && mainHash->entries[index].key.compare_exchange_strong(empty, id, std::memory_order_relaxed, std::memory_order_relaxed)))
                                 {
 #endif
@@ -3881,6 +4081,7 @@ namespace moodycamel
                             }
                         }
 
+                        // 返回找到的 producer
                         return value;
                     }
                     if (probedKey == details::invalid_thread_id)
@@ -3892,10 +4093,12 @@ namespace moodycamel
             }
 
             // Insert!
+            // 【NOTE1】：这里已经对 producer hash count 进行了自增（如果后面有创建失败的情况，需要减去一）
             auto newCount = 1 + implicitProducerHashCount.fetch_add(1, std::memory_order_relaxed);
             while (true)
             {
                 // NOLINTNEXTLINE(clang-analyzer-core.NullDereference)
+                // 当生产者的数量已经超过当前哈希表大小的一半并且允许调整 hash 表的大小时，调整哈希表的大小，申请新的 hash 表
                 if (newCount >= (mainHash->capacity >> 1) && !implicitProducerHashResizeInProgress.test_and_set(std::memory_order_acquire))
                 {
                     // We've acquired the resize lock, try to allocate a bigger hash table.
@@ -3903,17 +4106,23 @@ namespace moodycamel
                     // we reload implicitProducerHash it must be the most recent version (it only gets changed within this
                     // locked block).
                     mainHash = implicitProducerHash.load(std::memory_order_acquire);
+                    // 重新进行判断（可能有其他线程已经进行了 hash 扩容操作）
                     if (newCount >= (mainHash->capacity >> 1))
                     {
+                        // 申请的新的 hash 表是原来 hash 表大小的两倍
                         auto newCapacity = mainHash->capacity << 1;
+                        // 判断调整后的 hash 表的大小是否满足生产者数量的要求
                         while (newCount >= (newCapacity >> 1))
                         {
+                            // 如果生产者的数量仍然大于新的 hash 容量大小的一半，继续将 hash 扩大两倍
                             newCapacity <<= 1;
                         }
+
                         auto raw = static_cast<char *>((Traits::malloc)(sizeof(ImplicitProducerHash) + std::alignment_of<ImplicitProducerKVP>::value - 1 + sizeof(ImplicitProducerKVP) * newCapacity));
                         if (raw == nullptr)
                         {
                             // Allocation failed
+                            // 见【NOTE1】
                             implicitProducerHashCount.fetch_sub(1, std::memory_order_relaxed);
                             implicitProducerHashResizeInProgress.clear(std::memory_order_relaxed);
                             return nullptr;
@@ -3927,6 +4136,7 @@ namespace moodycamel
                             new (newHash->entries + i) ImplicitProducerKVP;
                             newHash->entries[i].key.store(details::invalid_thread_id, std::memory_order_relaxed);
                         }
+
                         newHash->prev = mainHash;
                         implicitProducerHash.store(newHash, std::memory_order_release);
                         implicitProducerHashResizeInProgress.clear(std::memory_order_release);
@@ -3934,24 +4144,33 @@ namespace moodycamel
                     }
                     else
                     {
+                        // 已经有其他线程进行了 hash 扩容操作
                         implicitProducerHashResizeInProgress.clear(std::memory_order_release);
                     }
                 }
 
+                // 上面如果进行了 hash 扩容操作，那么同样会执行下面的 if() 语句中的内容
+
                 // If it's < three-quarters full, add to the old one anyway so that we don't have to wait for the next table
                 // to finish being allocated by another thread (and if we just finished allocating above, the condition will
                 // always be true)
+                // 如果 生产者数量仅小于四分之三的时候，不需要进行 hash 扩容，可以直接将新的 producer 插入到原来的 hash 表中
+                // 创建新的 producer，并可以将 produer 插入到 hash 表中
                 if (newCount < (mainHash->capacity >> 1) + (mainHash->capacity >> 2))
                 {
                     bool recycled;
+                    // 隐式生产者永远不会被重用（由 free-list 管理）
                     auto producer = static_cast<ImplicitProducer *>(recycle_or_create_producer(false, recycled));
                     if (producer == nullptr)
                     {
+                        // 见【NOTE1】
                         implicitProducerHashCount.fetch_sub(1, std::memory_order_relaxed);
                         return nullptr;
                     }
                     if (recycled)
                     {
+                        // 见【NOTE1】
+                        // （显式生产者）循环利用旧的 producer，没有 create 新的 producer
                         implicitProducerHashCount.fetch_sub(1, std::memory_order_relaxed);
                     }
 
@@ -3977,17 +4196,21 @@ namespace moodycamel
                         if ((probedKey == empty && mainHash->entries[index].key.compare_exchange_strong(empty, id, std::memory_order_relaxed, std::memory_order_relaxed)))
                         {
 #endif
+                            // 把 producer 使用线程 id 做 key 之后添加到 hash 表中
                             mainHash->entries[index].value = producer;
                             break;
                         }
                         ++index;
                     }
+
+                    // 返回新创建的 producer
                     return producer;
                 }
 
                 // Hmm, the old hash is quite full and somebody else is busy allocating a new one.
                 // We need to wait for the allocating thread to finish (if it succeeds, we add, if not,
                 // we try to allocate ourselves).
+                // 如果有其他线程正在对当前 hash 表进行扩容操作，我们只需要等待扩容成功即可（如果其他线程扩容成功，这里更新 mainHash，否则当前线程亲自对 hash 进行扩容操作）
                 mainHash = implicitProducerHash.load(std::memory_order_acquire);
             }
         }
@@ -4115,8 +4338,8 @@ namespace moodycamel
         }
 
     private:
-        std::atomic<ProducerBase *> producerListTail;
-        std::atomic<std::uint32_t> producerCount;
+        std::atomic<ProducerBase *> producerListTail; // 生产者链表的 tail（所有的生产者是用 free-list 方式组织起来的）
+        std::atomic<std::uint32_t> producerCount;     // 生产者数量
 
         std::atomic<size_t> initialBlockPoolIndex;
         Block *initialBlockPool;
@@ -4128,8 +4351,8 @@ namespace moodycamel
         debug::DebugFreeList<Block> freeList;
 #endif
 
-        std::atomic<ImplicitProducerHash *> implicitProducerHash;
-        std::atomic<size_t> implicitProducerHashCount; // Number of slots logically used
+        std::atomic<ImplicitProducerHash *> implicitProducerHash; // 隐式生产者 hash
+        std::atomic<size_t> implicitProducerHashCount;            // Number of slots logically used（生产者 hash 表的数量）
         ImplicitProducerHash initialImplicitProducerHash;
         std::array<ImplicitProducerKVP, INITIAL_IMPLICIT_PRODUCER_HASH_SIZE> initialImplicitProducerHashEntries;
         std::atomic_flag implicitProducerHashResizeInProgress;
@@ -4204,7 +4427,6 @@ namespace moodycamel
     {
         a.swap(b);
     }
-
 }
 
 #if defined(_MSC_VER) && (!defined(_HAS_CXX17) || !_HAS_CXX17)
