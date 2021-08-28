@@ -615,6 +615,10 @@ namespace moodycamel
 #pragma warning(disable : 4554)
 #endif
             static_assert(std::is_integral<T>::value && !std::numeric_limits<T>::is_signed, "circular_less_than is intended to be used only with unsigned integer types");
+            // CHAR_BIT  用来表示一个字符对象所占用的 BIT 数（实际取决于编译器体系结构或者库的实现）
+            // std::cout << "static_cast<T>(a - b) = " << static_cast<T>(a - b) << std::endl;
+            // std::cout << "sizeof(T) = " << sizeof(T) << std::endl;
+            // std::cout << "CHAR_BIT = " << CHAR_BIT << std::endl;
             return static_cast<T>(a - b) > static_cast<T>(static_cast<T>(1) << static_cast<T>(sizeof(T) * CHAR_BIT - 1));
 #ifdef _MSC_VER
 #pragma warning(pop)
@@ -2058,11 +2062,13 @@ namespace moodycamel
 
             inline T *operator[](index_t idx) MOODYCAMEL_NOEXCEPT
             {
+                // 注意这里的重载：idx & static_cast<index_t>(BLOCK_SIZE - 1) 的操作保证了无论 idx（即block的下标）变得多大，这里都会将访问范围限制在 0 ~ BLOCK_SIZE -1 的范围内
                 return static_cast<T *>(static_cast<void *>(elements)) + static_cast<size_t>(idx & static_cast<index_t>(BLOCK_SIZE - 1));
             }
 
             inline T const *operator[](index_t idx) const MOODYCAMEL_NOEXCEPT
             {
+                // 同上
                 return static_cast<T const *>(static_cast<void const *>(elements)) + static_cast<size_t>(idx & static_cast<index_t>(BLOCK_SIZE - 1));
             }
 
@@ -2151,13 +2157,28 @@ namespace moodycamel
             inline index_t getTail() const { return tailIndex.load(std::memory_order_relaxed); }
 
         protected:
+            /**
+             * 每一个 block index 中所有 entry 中的 block 中的 index 序号是连续的。
+             * 举例说明：
+             *     假如有 BLOCK_SIZE 的大小为 5，block index 中目前有两个 block index entry，每个 entry 对应着一个 block，分别为 first_block 和 second_block，两者关系为 first_block->next = second_block。
+             *     那么就有如下 index：first_block 中 index 的序号为 0 ~ 4，second_block 中 block 的序号为 5 ~ 9
+             *     在进行入队操作时，block 会通过 next 指针移动，但是 index 会一直递增。
+             *     也就是说，如果在 second_block 的第一个 slot 中插入元素，则下标操作会是 second_block[4 + 1]。但是这种下标访问方式并不会造成非法访问，因为 block 重载了 [] 下标访问运算符，
+             *     也就是将 second_block[5] 的下标转换成了 second_block[0] 的下标操作。
+             *
+             * 假如入队的元素数量为 9999，那么等所有元素入队之后 tailIndex 为 9999（tail index 为入队元素的数量）
+             *
+             * 保持 index 连续，这样设计的好处在于给定一个 index，可以通过偏移量计算出来这个 index 对应的是哪一个 entry。通常用在元素出队的操作中。
+             *
+             * 注意：以上这种方式出现在入队操作中！！！
+             **/
             std::atomic<index_t> tailIndex; // Where to enqueue to next
             std::atomic<index_t> headIndex; // Where to dequeue from next
 
             std::atomic<index_t> dequeueOptimisticCount;
             std::atomic<index_t> dequeueOvercommit;
 
-            Block *tailBlock;
+            Block *tailBlock; // 当前 block index 中的最后一个 block（entry 指针指向该 block）
 
         public:
             bool isExplicit;
@@ -2982,6 +3003,7 @@ namespace moodycamel
             template <AllocationMode allocMode, typename U>
             inline bool enqueue(U &&element)
             {
+                // 需要注意的是：这里的 tailIndex 和 currentTailIndex 是不断递增的，但是在插入 block[currentTailIndex] 时并不会造成非法访问，原因见下：
                 index_t currentTailIndex = this->tailIndex.load(std::memory_order_relaxed);
                 index_t newTailIndex = 1 + currentTailIndex;
                 if ((currentTailIndex & static_cast<index_t>(BLOCK_SIZE - 1)) == 0)
@@ -2998,7 +3020,7 @@ namespace moodycamel
 #endif
                     // Find out where we'll be inserting this block in the block index
                     BlockIndexEntry *idxEntry;
-                    // 当 block index 用完时，允许 new 新的 block index（并和原来的 block index 连成链表）
+                    // 当前 block entry 指向的 block 中的 slot 用完了，允许 new 新的 block，并让下一个 entry 指向新的 block（也就是插入一个新的 block entry）
                     if (!insert_block_index_entry<allocMode>(idxEntry, currentTailIndex))
                     {
                         return false;
@@ -3008,6 +3030,7 @@ namespace moodycamel
                     auto newBlock = this->parent->ConcurrentQueue::template requisition_block<allocMode>();
                     if (newBlock == nullptr)
                     {
+                        // block pool 已经用完并且申请内存失败，可以重用之前 entry 指向的 block，但是这里就需要重置 block tail（将 entries 作为一个 entry 的循环数组）
                         rewind_block_index_tail();
                         idxEntry->value.store(nullptr, std::memory_order_relaxed);
                         return false;
@@ -3046,6 +3069,12 @@ namespace moodycamel
                 }
 
                 // Enqueue
+                // 填充 block[currentTailIndex] 的 slot
+                /**
+                 * 需要注意的是，这里的 currentTailIndex 是不断递增的，但是每个 block 的的 BLOCK_SIZE 是固定的，为什么这里没有溢出？
+                 * 因为 block 对 下标访问运算符[] 做了重载，所以只需要移动 tailBlock 的指针即可。
+                 * 具体重载方式可以参考 block 对 下标访问运算符 做重载处的代码注释或者 tailIndex 和 headIndex 定义处的说明
+                 * */
                 new ((*this->tailBlock)[currentTailIndex]) T(std::forward<U>(element));
 
                 this->tailIndex.store(newTailIndex, std::memory_order_release);
@@ -3069,10 +3098,12 @@ namespace moodycamel
                         index_t index = this->headIndex.fetch_add(1, std::memory_order_acq_rel);
 
                         // Determine which block the element is in
+                        // 因为 index 是保持连续的，所以可以通过偏移量得到 index 对应的是哪一个 entry，然后得到 entry 的 value，即是对应的 block
                         auto entry = get_block_index_entry_for_index(index);
 
                         // Dequeue
                         auto block = entry->value.load(std::memory_order_relaxed);
+                        // 注意这里由于 block 对下标运算符做了重载，这里可以用 block[index] 获得对应 block 中的 下标元素
                         auto &el = *((*block)[index]);
 
                         if (!MOODYCAMEL_NOEXCEPT_ASSIGN(T, T &&, element = std::move(el)))
@@ -3104,6 +3135,7 @@ namespace moodycamel
                         }
                         else
                         {
+                            // 出队、调用析构函数析构对应的元素
                             element = std::move(el); // NOLINT
                             el.~T();                 // NOLINT
 
@@ -3114,8 +3146,10 @@ namespace moodycamel
                                     debug::DebugLock lock(mutex);
 #endif
                                     // Add the block back into the global free pool (and remove from block index)
+                                    // 如果整个 block 为空，则将 entry 的 value 置为 nullptr
                                     entry->value.store(nullptr, std::memory_order_relaxed);
                                 }
+                                // 整个 block 为空，将 block 放入到 block pool 中
                                 this->parent->add_block_to_free_list(block); // releases the above store
                             }
                         }
@@ -3146,13 +3180,19 @@ namespace moodycamel
                 // this happens if it was filled up exactly to the top (setting tailIndex to
                 // the first index of the next block which is not yet allocated), then dequeued
                 // completely (putting it on the free list) before we enqueue again.
-
                 index_t startTailIndex = this->tailIndex.load(std::memory_order_relaxed);
+                // 注意这里维护了两个 block 的指针 startBlock 和 endBlock。在进行 block 分配的时候，会移动这两个指针指向分配的头 block 和尾 block
+                // 在元素入队操作的时候，同样会移动 startBlock 的指针，进行入队操作。入队完成的判断条件就是 startBlock == endBlock
                 auto startBlock = this->tailBlock;
-                Block *firstAllocatedBlock = nullptr;
                 auto endBlock = this->tailBlock;
+                Block *firstAllocatedBlock = nullptr; // 分配 block 的时候指向第一个分配的 block（在进行入队操作的时候会用到这个变量）
 
                 // Figure out how many blocks we'll need to allocate, and do so
+                /**
+                 * 计算需要分配多少个 block，然后进行分配：
+                 * 举例说明：假如用户在定义 ConcurrentQueue 队列的时候，指定的 BLOCK_SIZE 的大小为 2。
+                 * 如果用户需要入队 3 个元素，就需要分配两个 block（见 example: enqueue_bulk），这里的 blockBaseDiff 就为 4
+                 * */
                 size_t blockBaseDiff = ((startTailIndex + count - 1) & ~static_cast<index_t>(BLOCK_SIZE - 1)) - ((startTailIndex - 1) & ~static_cast<index_t>(BLOCK_SIZE - 1));
                 index_t currentTailIndex = (startTailIndex - 1) & ~static_cast<index_t>(BLOCK_SIZE - 1);
                 if (blockBaseDiff > 0)
@@ -3162,7 +3202,7 @@ namespace moodycamel
 #endif
                     do
                     {
-                        blockBaseDiff -= static_cast<index_t>(BLOCK_SIZE);
+                        blockBaseDiff -= static_cast<index_t>(BLOCK_SIZE); // 控制着分配的 block 的次数
                         currentTailIndex += static_cast<index_t>(BLOCK_SIZE);
 
                         // Find out where we'll be inserting this block in the block index
@@ -3173,6 +3213,7 @@ namespace moodycamel
                         assert(!details::circular_less_than<index_t>(currentTailIndex, head));
                         bool full = !details::circular_less_than<index_t>(head, currentTailIndex + BLOCK_SIZE) || (MAX_SUBQUEUE_SIZE != details::const_numeric_max<size_t>::value && (MAX_SUBQUEUE_SIZE == 0 || MAX_SUBQUEUE_SIZE - BLOCK_SIZE < currentTailIndex - head));
 
+                        // 将 block index entry 插入到 block index 里面，并且申请新的 block 和 entry 中的 value 关联（key 为 currentTailIndex）
                         if (full || !(indexInserted = insert_block_index_entry<allocMode>(idxEntry, currentTailIndex)) || (newBlock = this->parent->ConcurrentQueue::template requisition_block<allocMode>()) == nullptr)
                         {
                             // Index allocation or block allocation failed; revert any other allocations
@@ -3219,12 +3260,14 @@ namespace moodycamel
                 }
 
                 // Enqueue, one block at a time
+                // 一次入队一个 block（一次填充一个 block 中的所有元素）
                 index_t newTailIndex = startTailIndex + static_cast<index_t>(count);
                 currentTailIndex = startTailIndex;
                 this->tailBlock = startBlock;
                 assert((startTailIndex & static_cast<index_t>(BLOCK_SIZE - 1)) != 0 || firstAllocatedBlock != nullptr || count == 0);
                 if ((startTailIndex & static_cast<index_t>(BLOCK_SIZE - 1)) == 0 && firstAllocatedBlock != nullptr)
                 {
+                    // 将 tailBlock 指向了第一个分配的 block（入队操作时通过 next 指向移动到下一个 block。入队完成的条件就是 tailBlock == endBlock）
                     this->tailBlock = firstAllocatedBlock;
                 }
                 while (true)
@@ -3238,6 +3281,8 @@ namespace moodycamel
                     {
                         while (currentTailIndex != stopIndex)
                         {
+                            // currentTailIndex 在不断递增，但是并不会造成非法访问
+                            // 这里只需要注意移动 tailBlock 的指针即可
                             new ((*this->tailBlock)[currentTailIndex++]) T(*itemFirst++);
                         }
                     }
@@ -3303,8 +3348,11 @@ namespace moodycamel
                         assert(currentTailIndex == newTailIndex);
                         break;
                     }
+                    // 入队下一个 block
                     this->tailBlock = this->tailBlock->next;
                 }
+
+                // 更新 tailIndex
                 this->tailIndex.store(newTailIndex, std::memory_order_release);
                 return true;
             }
@@ -3354,7 +3402,7 @@ namespace moodycamel
                             if (MOODYCAMEL_NOEXCEPT_ASSIGN(T, T &&, details::deref_noexcept(itemFirst) = std::move((*(*block)[index]))))
                             {
                                 while (index != endIndex)
-                                {
+                                { // 在这里 index 和 endIndex 也会判断出队的元素数量
                                     auto &el = *((*block)[index]);
                                     *itemFirst++ = std::move(el);
                                     el.~T();
@@ -3416,7 +3464,7 @@ namespace moodycamel
                                 this->parent->add_block_to_free_list(block); // releases the above store
                             }
                             indexIndex = (indexIndex + 1) & (localBlockIndex->capacity - 1);
-                        } while (index != firstIndex + actualCount);
+                        } while (index != firstIndex + actualCount); // 注意：这里 while 循环的判断条件，因为 index 是不断递增的，所以可以通过这种方式判断出队的数量
 
                         return actualCount;
                     }
@@ -3442,12 +3490,13 @@ namespace moodycamel
             struct BlockIndexHeader
             {
                 size_t capacity;          // block index 的容量（实际上是 block index 中 entries 的数量，每一个 entry 都指向一个 block，每个 block 都有多个 slot，可以保存多个元素）
-                std::atomic<size_t> tail; // block index 中 entry 尾部（entry 是一个数组，随着 entry 数组中元素的的不断新增，该值会逐渐增大，并始终指向 entry 中最后一个新元素。类似于下标）
+                std::atomic<size_t> tail; // block index 中 entries 尾部（entries 是一个数组，每个元素都是一个 entry，tail 是最后一个 entry 的索引）
                 BlockIndexEntry *entries; // entries 可以看成一个数组，数组的每个元素都是 entry，每个 entry 是一个 KV 键值对，value 是 block 的指针
                 BlockIndexEntry **index;  // 指向 entries 的指针
                 BlockIndexHeader *prev;   // 多个 block index 会组成一个链表。该指针用来指向前一个 block index
             };
 
+            // 将一个新的 blockIndexEntry 插入到 blockIndexEntries 里面
             template <AllocationMode allocMode>
             inline bool insert_block_index_entry(BlockIndexEntry *&idxEntry, index_t blockStartIndex)
             {
@@ -3474,7 +3523,7 @@ namespace moodycamel
                 {
                     return false;
                 }
-                // 当 block index 里的所有 entries 填满之后，会申请下一个 block index
+                // 当 block index 里的所有 entries 填满之后，会申请下一个 block index（并和原来的 block index 连成链表）
                 else if (!new_block_index())
                 {
                     return false;
@@ -3526,6 +3575,7 @@ namespace moodycamel
                 // prevCapacity: 上一次创建的 block index 的 capacity
                 size_t prevCapacity = prev == nullptr ? 0 : prev->capacity;
                 auto entryCount = prev == nullptr ? nextBlockIndexCapacity : prevCapacity;
+                // 分配内存：block index 的大小 = blockIndexHeader + entries + indexs
                 auto raw = static_cast<char *>((Traits::malloc)(sizeof(BlockIndexHeader) +
                                                                 std::alignment_of<BlockIndexEntry>::value - 1 + sizeof(BlockIndexEntry) * entryCount +
                                                                 std::alignment_of<BlockIndexEntry *>::value - 1 + sizeof(BlockIndexEntry *) * nextBlockIndexCapacity));
@@ -3568,6 +3618,7 @@ namespace moodycamel
                 header->entries = entries;
                 header->index = index;
                 header->capacity = nextBlockIndexCapacity;
+                // 这里 tail 是创建 block index 时初始化值，后面在入队操作的时候会对 tail 进行更新
                 header->tail.store((prevCapacity - 1) & (nextBlockIndexCapacity - 1), std::memory_order_relaxed);
 
                 blockIndex.store(header, std::memory_order_release);
