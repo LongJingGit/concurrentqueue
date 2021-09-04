@@ -465,7 +465,7 @@ namespace moodycamel
 
         // How many full blocks can be expected for a single explicit producer? This should
         // reflect that number's maximum for optimal performance. Must be a power of 2.
-        // 一个显式生产者可以有多少完整的块。这是能够发挥最佳性能的最大数值
+        // 一个显式生产者可以有多少完整的 block。这是能够发挥最佳性能的最大数值
         static const size_t EXPLICIT_INITIAL_INDEX_SIZE = 32;
 
         // How many full blocks can be expected for a single implicit producer? This should
@@ -989,8 +989,8 @@ namespace moodycamel
      */
 
     /* block pool design:
-     * 这里使用了两个不同的块池:
-     *   1. 首先，有预分配块的初始数组。一旦消耗殆尽，这个池子将永远空着。简化了无等待的实现， fetch-and-add（获取空闲块的下一个索引）和检查(确保该索引在范围内)
+     * 这里使用了两个不同的 block pool:
+     *   1. 首先，有预分配块的初始数组。一旦消耗殆尽，这个池子将永远空着。简化了 wait-free 的实现， fetch-and-add（获取空闲块的下一个索引）和检查(确保该索引在范围内)
      *   2. 其次，有一个 lock-free 的全局 free-list（这里的全局指的是对高级队列的全局）。它是 lock-free 的，但不是 wait-free 的。
      *      free-list 元素是一些准备被重用的已用 block。具体实现是一个 lock-free 的单链表，头指针初始化为 null。
      * free-list 的 add 操作：block 的 next 指针被设置为 头指针，然后头指针在头没有改变的情况下使用 CAS 操作更新为指向 block，
@@ -1020,27 +1020,28 @@ namespace moodycamel
      * 并在该偏移量上查找索引项，可以很容易地找到已知在索引中的任何 block。
      * 需要特别注意，以确保当 block 索引换行时，算法仍然有效(尽管假设在任何给定时刻，相同的基本索引不会出现(或看起来出现)两次在索引中)。
      *
-     * 当一个 block 被用完时，它会从索引中移除(为以后的 block 插入腾出空间); 由于另一个消费者可能仍然在使用索引中的那个条目(计算偏移量)，索引条目没有被完全删除，但是 block 指针被设置为空，
+     * 当一个 block 被用完时，它会从 block index 中移除(为以后的 block 插入腾出空间); 由于另一个消费者可能仍然在使用 block (计算偏移量)，
+     * block 没有被完全删除，但是 block 指针被设置为空，
      * 这向生产者表明 slot 可以被重用; 对于任何仍在使用它来计算偏移量的消费者，block 基是不受影响的。 因为生产者只有在所有之前的插槽都是空闲的时候才会重新使用一个插槽，
      * 而当消费者在索引中查找一个 block 时，索引中必须至少有一个非空闲的插槽(对应于它正在查找的 block)，而且消费者用来查找 block 的 block 索引条目至少和那个块的块索引条目一样，
      * 在生产者重用一个槽和消费者使用那个槽查找块之间不会有竞争条件。
      *
-     * 当消费者想要将一个条目放入队列中时，如果 block 索引中没有空间了，它(如果允许的话)会分配另一个 block 索引(链接到旧的 block 索引，以便在队列被破坏时最终释放它的内存)，
+     * 当消费者想要将一个条目放入队列中时，如果 block index 中没有空间了，它(如果允许的话)会分配另一个 block index (链接到旧的 block 索引，以便在队列被破坏时最终释放它的内存)，
      * 从那时起它就成为主索引。新索引是旧索引的副本，只是大小是旧索引的两倍; 复制所有索引项允许消费者只需要在一个索引中查找他们要查找的块(在一个块中定时退出队列)。
      * 由于在构造新索引时，消费者可能正在将索引项标记为空闲(通过将块指针设置为空)，因此索引项本身不会被复制，而是指向它们的指针。 这确保消费者对旧索引的任何更改也会正确地影响当前索引。
      */
 
     /* 显示队列的设计：
-     * 显示队列是一个 block 的环状链表。在快速路径是 wait-free 的，但是当需要从 block pool 中获取快或者分配新的 block 时，
+     * 显示队列是一个 block 的环状单链表。在快速路径是 wait-free 的，但是当需要从 block pool 中获取快或者分配新的 block 时，
      * 它只是 lock-free 的。这种情况发生在内部缓存的 block 都满了，或者一开始的情况。
      *
-     * 一旦一个 block 被添加到显示生产者队列的循环链表中，它将永远不会被删除。
+     * 一旦一个 block 被添加到显式生产者队列的循环链表中，它将永远不会被删除。
      *
      * tail block 指针由生产者维护，它指向当前要插入的元素的 block；当 tail block 填满时，将检查下一个 block 是否为空。如果是空的，则将 tail block 指向该 block;
      * 否则申请一个新的 block 并将其插入到循环链表的尾部，然后更新 tail block 指向这个新的 block。
      *
      * 当一个元素从完全从 block 中退出时，就设置标志表示这个 slot 为 emtpy。生产者通过检查这些标志来判断 block 是否为空。
-     * 如果 BLOCK_SIZE 很小，可以通过检查标志的方式来判断 block 是否为空；如果 BLOCK_SIZE 很大，则需要通过原子计数来判断。
+     * 如果 BLOCK_SIZE 很小，可以通过检查标志的方式来判断 block 是否为空；如果 BLOCK_SIZE 很大，则需要通过原子变量来判断。
      *
      * 为了在常数时间内对 block 进行索引，这里使用了一个 循环的缓冲区（环状数组）。索引由生产者进行维护，消费者可以读取但是不能写入。
      */
@@ -1115,11 +1116,11 @@ namespace moodycamel
         // queue is fully constructed before it starts being used by other threads (this
         // includes making the memory effects of construction visible, possibly with a
         // memory barrier).
-        /*
+        /**
          * 注意，在不分配额外内存的情况下可以插入的元素的实际数量取决于生产者的数量和块的大小。
          * 如果块的大小等于 capacity，则会预先只分配一个 block。这意味着只能有一个生产者能够在不额外分配内存的情况下将元素放入队列，并且 block 不会在生产者之间共享
          * 不是线程安全的。在队列被其他线程使用之前，用户要确保队列已经完全构造好（包括使构造的内存可见，可能使用内存屏障）
-         */
+         **/
         explicit ConcurrentQueue(size_t capacity = 6 * BLOCK_SIZE)
             : producerListTail(nullptr),
               producerCount(0),
@@ -2175,8 +2176,13 @@ namespace moodycamel
             std::atomic<index_t> tailIndex; // Where to enqueue to next
             std::atomic<index_t> headIndex; // Where to dequeue from next
 
-            std::atomic<index_t> dequeueOptimisticCount;
-            std::atomic<index_t> dequeueOvercommit;
+            /**
+             * 实际出队的元素数量为：dequeueOptimisticCount - dequeueOvercommit
+             * 比如队列中有 60 个元素，因为存在多个消费者并行出队的情况，所以有可能出队操作被调用 61 次。则 dequeueOptimisticCount 为 61，dequeueOvercommit 为 1。
+             * 实际的出队数量为 61 - 1 = 60
+             **/
+            std::atomic<index_t> dequeueOptimisticCount; // 乐观上出队的元素数量（并不是实际出队的元素数量，消费者判断有元素可以出队时，就会递增该计数）
+            std::atomic<index_t> dequeueOvercommit;      // 出队次数超过队列中元素个数的数量
 
             Block *tailBlock; // 当前 block index 中的最后一个 block（entry 指针指向该 block）
 
@@ -2205,6 +2211,13 @@ namespace moodycamel
                   pr_blockIndexEntries(nullptr),
                   pr_blockIndexRaw(nullptr)
             {
+                // 指定的 block 数量如果小于 block pool 中 block 的数量，则需要按照 block pool 中 block 的数量来分配内存（block pool 是满足用户存储要求的最小capacity）
+                /**
+                 * 这里需要了解 block pool 的大小是如何计算出来的：
+                 * 用户使用模板参数 BLOCK_SIZE 可以指定一个 block 的大小，同时用户在定义同步队列时通过构造函数的参数指定了需要容纳的数量 capacity.
+                 * 所以 block pool 中的 block 的初始数量为 capacity / BLOCK_SIZE。block pool 中申请了足够容纳 capacity 元素的 block
+                 * 所以，如果用户指定的初始 BLOCK_INDEX 中 block 数量小于 block pool 中 block 的数量，这种情况下 BLOCK_INDEX 是无法满足存储要求的，需要按照 block pool 的大小来申请内存
+                 **/
                 size_t poolBasedIndexSize = details::ceil_to_pow_2(parent_->initialBlockPoolSize) >> 1;
                 if (poolBasedIndexSize > pr_blockIndexSize)
                 {
@@ -2360,6 +2373,7 @@ namespace moodycamel
                         }
                         else
                         {
+                            // 单链表插入操作
                             newBlock->next = this->tailBlock->next;
                             this->tailBlock->next = newBlock;
                         }
@@ -2367,6 +2381,7 @@ namespace moodycamel
                         ++pr_blockIndexSlotsUsed;
                     }
 
+                    // noexcept: 如果表达式会抛出异常，则按照下面会抛出异常的逻辑处理（抛出异常，并捕获异常）
                     MOODYCAMEL_CONSTEXPR_IF(!MOODYCAMEL_NOEXCEPT_CTOR(T, U, new (static_cast<T *>(nullptr)) T(std::forward<U>(element))))
                     {
                         // The constructor may throw. We want the element not to appear in the queue in
@@ -2395,6 +2410,7 @@ namespace moodycamel
                     entry.base = currentTailIndex;
                     entry.block = this->tailBlock;
                     blockIndex.load(std::memory_order_relaxed)->front.store(pr_blockIndexFront, std::memory_order_release);
+                    // 更新下一个 entry 的下标
                     pr_blockIndexFront = (pr_blockIndexFront + 1) & (pr_blockIndexSize - 1);
 
                     MOODYCAMEL_CONSTEXPR_IF(!MOODYCAMEL_NOEXCEPT_CTOR(T, U, new (static_cast<T *>(nullptr)) T(std::forward<U>(element))))
@@ -2407,6 +2423,7 @@ namespace moodycamel
                 // Enqueue
                 new ((*this->tailBlock)[currentTailIndex]) T(std::forward<U>(element));
 
+                // tailIndex 是在不断递增的，但是仍然不会造成非法访问
                 this->tailIndex.store(newTailIndex, std::memory_order_release);
                 return true;
             }
@@ -2416,6 +2433,8 @@ namespace moodycamel
             {
                 auto tail = this->tailIndex.load(std::memory_order_relaxed);
                 auto overcommit = this->dequeueOvercommit.load(std::memory_order_relaxed);
+                // this->dequeueOptimisticCount.load(std::memory_order_relaxed) - overcommit 可以得到实际出队元素的数量
+                // 可能有多个消费者同时调用到这里，所以如果实际出队元素的数量小于 tailIndex，表示可能有元素可以出队（但并不一定所有消费者都可以消费到数据）
                 if (details::circular_less_than<index_t>(this->dequeueOptimisticCount.load(std::memory_order_relaxed) - overcommit, tail))
                 {
                     // Might be something to dequeue, let's give it a try
@@ -2437,6 +2456,7 @@ namespace moodycamel
                     std::atomic_thread_fence(std::memory_order_acquire);
 
                     // Increment optimistic counter, then check if it went over the boundary
+                    // 递增乐观出队计数（注意：并不是实际的出队元素的数量）
                     auto myDequeueCount = this->dequeueOptimisticCount.fetch_add(1, std::memory_order_relaxed);
 
                     // Note that since dequeueOvercommit must be <= dequeueOptimisticCount (because dequeueOvercommit is only ever
@@ -2449,11 +2469,25 @@ namespace moodycamel
                     // Note that we reload tail here in case it changed; it will be the same value as before or greater, since
                     // this load is sequenced after (happens after) the earlier load above. This is supported by read-read
                     // coherency (as defined in the standard), explained here: http://en.cppreference.com/w/cpp/atomic/memory_order
+                    // 可能有生产者更新了 tailIndex，所以需要重新载入 tailIndex 的值
                     tail = this->tailIndex.load(std::memory_order_acquire);
+
+                    /**
+                     * myDequeueCount - overcommit 可以得到实际出队元素的数量
+                     * 如果出队的数量大于或者等于 tailIndex 的值，则出队失败
+                     *
+                     * 为什么要进行第二次判断：
+                     * 上面第一次判断，可能有多个消费者同时读取 tailIndex，并且每个线程都得到有元素可以出队的结论。
+                     * 但是考虑到线程执行出队操作的先后顺序，如果有某个线程在其他线程执行具体出队操作之前，
+                     * 已经将队列中的元素出队，并更新了 dequeueOptimisticCount，那么其他线程再出队就会造成错误，
+                     * 所以在 std::atomic_thread_fence 栅栏之后，需要进行第二次判断。
+                     **/
                     if ((details::likely)(details::circular_less_than<index_t>(myDequeueCount - overcommit, tail)))
                     {
+                        // 保证此时的队列里必须有一个元素可以出队！
                         // Guaranteed to be at least one element to dequeue!
 
+                        // 获取 headIndex，且必须不会超过 tail
                         // Get the index. Note that since there's guaranteed to be at least one element, this
                         // will never exceed tail. We need to do an acquire-release fence here since it's possible
                         // that whatever condition got us to this point was for an earlier enqueued element (that
@@ -2472,7 +2506,12 @@ namespace moodycamel
                         // We need to be careful here about subtracting and dividing because of index wrap-around.
                         // When an index wraps, we need to preserve the sign of the offset when dividing it by the
                         // block size (in order to get a correct signed block count offset in all cases):
+                        // 因为索引是环绕的，所以在这里需要特别注意减法和除法。
+                        // 所以在这里我们保留了索引偏移量的符号
                         auto headBase = localBlockIndex->entries[localBlockIndexHead].base;
+                        // 通过 index 的偏移造成 blockBaseIndex 的改变，最终造成 offset 的改变。
+                        // 最终的目的是为了索引到正确的 block 和 index
+                        // 为什么不直接使用 index 作为偏移量：index 可以作为偏移量的，但是不能作为索引 block 的偏移量
                         auto blockBaseIndex = index & ~static_cast<index_t>(BLOCK_SIZE - 1);
                         auto offset = static_cast<size_t>(static_cast<typename std::make_signed<index_t>::type>(blockBaseIndex - headBase) / BLOCK_SIZE);
                         auto block = localBlockIndex->entries[(localBlockIndexHead + offset) & (localBlockIndex->size - 1)].block;
@@ -2501,6 +2540,7 @@ namespace moodycamel
                         {
                             element = std::move(el); // NOLINT
                             el.~T();                 // NOLINT
+                            // 将 这个 block 的 index 对应的 slot 设置为 null
                             block->ConcurrentQueue::Block::template set_empty<explicit_context>(index);
                         }
 
@@ -2853,9 +2893,9 @@ namespace moodycamel
 
             struct BlockIndexHeader
             {
-                size_t size;
-                std::atomic<size_t> front; // Current slot (not next, like pr_blockIndexFront)
-                BlockIndexEntry *entries;
+                size_t size;               // block index 中 block 的数量（也可以理解为 entry 的数量或者 entries 的大小）
+                std::atomic<size_t> front; // Current slot (not next, like pr_blockIndexFront) —— block index 中当前填充的 entries 的下标
+                BlockIndexEntry *entries;  // entry 数组，每一个数组元素都是一个 entry
                 void *prev;
             };
 
@@ -2864,6 +2904,7 @@ namespace moodycamel
                 auto prevBlockSizeMask = pr_blockIndexSize - 1;
 
                 // Create the new block
+                // attention: 如果是第二次申请 block index ，则申请的 block index 的大小是原来的两倍
                 pr_blockIndexSize <<= 1;
                 auto newRawPtr = static_cast<char *>((Traits::malloc)(sizeof(BlockIndexHeader) + std::alignment_of<BlockIndexEntry>::value - 1 + sizeof(BlockIndexEntry) * pr_blockIndexSize));
                 if (newRawPtr == nullptr)
@@ -2902,14 +2943,14 @@ namespace moodycamel
             }
 
         private:
-            std::atomic<BlockIndexHeader *> blockIndex;
+            std::atomic<BlockIndexHeader *> blockIndex; // 指向 block index 的指针
 
             // To be used by producer only -- consumer must use the ones in referenced by blockIndex
-            size_t pr_blockIndexSlotsUsed;
-            size_t pr_blockIndexSize;
-            size_t pr_blockIndexFront; // Next slot (not current)
-            BlockIndexEntry *pr_blockIndexEntries;
-            void *pr_blockIndexRaw;
+            size_t pr_blockIndexSlotsUsed;         // 已经被使用的 block 的数量（感觉这里翻译成 索引 不合适）（只要block 中被填充一个slot，都算作该 block 已经被使用）
+            size_t pr_blockIndexSize;              // 当前 block index 中 block 的数量
+            size_t pr_blockIndexFront;             // Next slot (not current) ： block index 中 所有 block 组成了一个 大数组--entries，front 表示下一个 entry
+            BlockIndexEntry *pr_blockIndexEntries; // 指向 block index 中 entries 的指针（Like blockIndexHeader 中的 BlockIndexEntry *entries）
+            void *pr_blockIndexRaw;                // 当前 block index 的原始内存指针
 
 #ifdef MOODYCAMEL_QUEUE_INTERNAL_DEBUG
         public:
@@ -3085,6 +3126,7 @@ namespace moodycamel
             bool dequeue(U &element)
             {
                 // See ExplicitProducer::dequeue for rationale and explanation
+                // 注意这里关于出队的特殊处理！！！
                 index_t tail = this->tailIndex.load(std::memory_order_relaxed);
                 index_t overcommit = this->dequeueOvercommit.load(std::memory_order_relaxed);
                 if (details::circular_less_than<index_t>(this->dequeueOptimisticCount.load(std::memory_order_relaxed) - overcommit, tail))
@@ -3147,6 +3189,7 @@ namespace moodycamel
 #endif
                                     // Add the block back into the global free pool (and remove from block index)
                                     // 如果整个 block 为空，则将 entry 的 value 置为 nullptr
+                                    // 可能有其他的消费者仍然在使用该 block(比如计算偏移量)，所以这里没有直接从 block index 中删除 block，而是将 block 指针置为空
                                     entry->value.store(nullptr, std::memory_order_relaxed);
                                 }
                                 // 整个 block 为空，将 block 放入到 block pool 中
@@ -3895,7 +3938,7 @@ namespace moodycamel
             recycled = false;
             // 以下函数调用完成了三个功能：
             // 1. creat producer 对象
-            // 2. 执行 隐式 producer 的构造函数，创建了新的 block index
+            // 2. 执行 producer 的构造函数，创建了新的 block index
             // 3. 将 producer 添加到链表中
             return add_producer(isExplicit ? static_cast<ProducerBase *>(create<ExplicitProducer>(this)) : create<ImplicitProducer>(this));
         }
