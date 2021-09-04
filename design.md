@@ -91,7 +91,7 @@ free-list 避免 ABA 问题：https://moodycamel.com/blog/2014/solving-the-aba-p
 
 出队操作时，读取 headIndex，根据 headIndex 计算得到即将要出队的 block，然后对该 block 中下标为 headIndex 的元素出队。元素出队完成后，会将该 slot 的标志位设置为空（元素入队的时候可以根据这个标志位来判断是否可以重用 block）。
 
-显式生产者的 producer list、block pool 的设计思路和隐式生产者的保持一致。
+显式生产者的 producer list、block pool 的设计思路和隐式生产者队列的保持一致。
 
 ## 参考文档
 
