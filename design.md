@@ -93,6 +93,10 @@ free-list 避免 ABA 问题：https://moodycamel.com/blog/2014/solving-the-aba-p
 
 显式生产者的 producer list、block pool 的设计思路和隐式生产者队列的保持一致。
 
+## TODO
+
+concurrentqueue 队列中所有关于 lock-free 的设计，以及如何在 lock-free 的队列中使用内存序和内存栅栏。
+
 ## 参考文档
 
 [Detailed Design of a Lock-Free Queue](https://moodycamel.com/blog/2014/detailed-design-of-a-lock-free-queue.htm)
