@@ -470,7 +470,7 @@ namespace moodycamel
 
         // How many full blocks can be expected for a single implicit producer? This should
         // reflect that number's maximum for optimal performance. Must be a power of 2.
-        // 一个隐式生产者最多可以拥有的 block 的数量
+        // 一个隐式生产者最多可以拥有的 block 的数量（每个 block index 中初始 index 的大小，即每个 block index 中可以最多拥有的 block 的数量）
         // 隐式生产者用循环缓冲区来管理 block index（缓冲区的每个元素都是一个指向 block 的索引），所以也可以理解成一个隐式生产者的循环缓冲区的大小
         static const size_t IMPLICIT_INITIAL_INDEX_SIZE = 32;
 
@@ -498,7 +498,7 @@ namespace moodycamel
         /*
          * 子队列中可以容纳的最大数量
          * 超过此限制的队列操作将失败
-         * 注意，这个限制是在块级别执行的(出于性能原因)，也就是说，它被舍入到最接近的块大小。
+         * 注意，这个限制是在 block 级别执行的(出于性能原因)，也就是说，它被舍入到最接近的块大小。
          **/
         static const size_t MAX_SUBQUEUE_SIZE = details::const_numeric_max<size_t>::value;
 
@@ -1208,12 +1208,14 @@ namespace moodycamel
                 auto next = block->freeListNext.load(std::memory_order_relaxed);
                 if (block->dynamicallyAllocated)
                 {
+                    // 只释放不属于 initailBlockPool 的 block
                     destroy(block);
                 }
                 block = next;
             }
 
             // Destroy initial free list
+            // 析构 block pool 中的每一个 block 对象，然后释放 block pool 的内存
             destroy_array(initialBlockPool, initialBlockPoolSize);
         }
 
@@ -1795,8 +1797,19 @@ namespace moodycamel
         {
             FreeListNode() : freeListRefs(0), freeListNext(nullptr) {}
 
-            std::atomic<std::uint32_t> freeListRefs;
-            std::atomic<N *> freeListNext;
+            /**
+             * ABA 的根本问题在于，读取 head 和 head->next 之间，head 已经发生了改变，这意味着 CAS 操作时，next 指针不一定是有效的。因此，引入引用计数。引用计数在读取 next 指针之前递增，在 CAS 操作之后递减。当引用计数非 0 的时候，任何线程不允许更改 node 的 next 指针。
+             * 只有当 node 的引用计数为 0 的时候，才可以执行 add 操作，将其放入到 freelist 中。除此之外，引用计数没有任何用途。
+             * 可以在 add 操作中一直自旋等待，直到 引用计数成为 0， 但这实际上是一个锁。
+             *
+             * 相反，可以利用 freelist 中节点顺序无关紧要这一事实：如果引用计数不为 0，则可以设置一个标志 SHOULD_BE_ON_FREELIST，指示应该将该 node 放入到列表中，并让使引用计数为 0 的线程稍后将其添加回去。这样，add() 操作就是 lock-free 的。
+             *
+             * 在设置 SHOULD_BE_ON_FREELIST 时需要格外小心，为了避免出现竞争，在设置标志位之前，先增加引用计数，然后递减。如果引用计数为 0，则调用 add() 的线程最终将负责将 node 放入到 freelist 中
+             *
+             * try_get() 方法中，一旦引用计数为 0，则不应该再增加，在开始将 node 添加到 freelist 的过程中，不应该再增加引用计数。要解决这个问题，我们首选要确保如果节点在列表中，引用计数永远不为 0.
+             */
+            std::atomic<std::uint32_t> freeListRefs;    // 引用计数：避免 ABA 问题
+            std::atomic<N *> freeListNext;              // 指向下一个 node 的指针
         };
 
         // A simple CAS-based lock-free free list. Not the fastest thing in the world under heavy contention, but
@@ -1829,6 +1842,7 @@ namespace moodycamel
 #endif
                 // We know that the should-be-on-freelist bit is 0 at this point, so it's safe to
                 // set it using a fetch_add
+                // 只有当引用计数为 0 的时候才允许执行 add 操作
                 if (node->freeListRefs.fetch_add(SHOULD_BE_ON_FREELIST, std::memory_order_acq_rel) == 0)
                 {
                     // Oh look! We were the last ones referencing this node, and we know
@@ -1849,6 +1863,7 @@ namespace moodycamel
                     auto refs = head->freeListRefs.load(std::memory_order_relaxed);
                     if ((refs & REFS_MASK) == 0 || !head->freeListRefs.compare_exchange_strong(refs, refs + 1, std::memory_order_acquire, std::memory_order_relaxed))
                     {
+                        // if 判断为真，说明已经有其他线程获取了 head 节点，所以当前线程需要重新读取 head 节点
                         head = freeListHead.load(std::memory_order_acquire);
                         continue;
                     }
@@ -1897,6 +1912,11 @@ namespace moodycamel
                 // something non-zero, then the refcount increment is done by the other thread) -- so, if the CAS
                 // to add the node to the actual list fails, decrease the refcount and leave the add operation to
                 // the next thread who puts the refcount back at zero (which could be us, hence the loop).
+                /**
+                 * 一般情况下，当 freeListRefs 为 0 的时候，只有一个线程可以执行本方法，可以安全的改变 node 的 next 指针。
+                 * 但是如果有其他的线程在 try_get 方法中将 freeListRefs 置为 0，则意味着会有其他的线程同时增加它的值，
+                 * 因此，如果执行 CAS 操作 add 失败，则需要减少 freeListRefs 的值，然后将 add 操作留给下一个将 freeListRefs 置为 0 的线程
+                 **/
                 auto head = freeListHead.load(std::memory_order_relaxed);
                 while (true)
                 {
@@ -1904,6 +1924,21 @@ namespace moodycamel
                     node->freeListRefs.store(1, std::memory_order_release);
                     if (!freeListHead.compare_exchange_strong(head, node, std::memory_order_release, std::memory_order_relaxed))
                     {
+                        /**
+                         * freelist 的插入和删除操作（add/try_get）都是从头结点开始的！
+                         *
+                         * CAS 操作失败的情况有两种：
+                         * 1. 其他线程在同时将新节点 node 插入 freelist
+                         * 2. 其他线程正在删除 freelist 的头结点（try_get）
+                         *
+                         * 对于第一种情况：
+                         *    A 线程正在 add node，B 线程也在 add node，且 B 线程先于 A 线程执行 add 成功，则 A 线程的 CAS 操作会失败。
+                         * B 线程需要在 while 循环中重新执行 CAS。freeListRefs 肯定为 1，因为没有其他线程修改 freeListRefs，即 if() 条件判断肯定为真
+                         *
+                         * 对于第二种情况：
+                         *    A 线程正在 add node，B 线程也在 add node，且 B 线程先于 A 线程执行 add 成功，则 A 线程的 CAS 操作会失败；此时 C 线程正在 try_get。
+                         *    A 线程 CAS 操作失败，则会将 “期望值替换为当前值，并返回 false”. 说明 head 会被替换为 freeListHead。即 node->freeListNext 指针会指向 B 线程刚插入的 freeListHead。
+                         */
                         // Hmm, the add failed, but we can only try again when the refcount goes back to zero
                         if (node->freeListRefs.fetch_add(SHOULD_BE_ON_FREELIST - 1, std::memory_order_release) == 1)
                         {
@@ -1918,8 +1953,8 @@ namespace moodycamel
             // Implemented like a stack, but where node order doesn't matter (nodes are inserted out of order under contention)
             std::atomic<N *> freeListHead;
 
-            static const std::uint32_t REFS_MASK = 0x7FFFFFFF;
-            static const std::uint32_t SHOULD_BE_ON_FREELIST = 0x80000000;
+            static const std::uint32_t REFS_MASK = 0x7FFFFFFF;                  // 引用计数的掩码
+            static const std::uint32_t SHOULD_BE_ON_FREELIST = 0x80000000;      // 标记当前 node 应该被放入 free list
 
 #ifdef MCDBGQ_NOLOCKFREE_FREELIST
             debug::DebugMutex mutex;
@@ -1949,7 +1984,12 @@ namespace moodycamel
             template <InnerQueueContext context>
             inline bool is_empty() const
             {
-                // 显式队列且小于阈值的时候，可以通过每个元素的 flag 标志来判断 block 是否为空
+                /**
+                 * 显式队列和隐式队列使用的判断方式不同：
+                 *
+                 * 显示队列：如果没有超过阈值，通过判断 block 中每个元素的 flag 标志位来判断 block 是否为空；否则通过已出队元素的数量来判断
+                 * 隐式队列：通过判断出队元素的数量是否等于 BLOCK_SIZE 的大小来判断 block 是否为空
+                 */
                 MOODYCAMEL_CONSTEXPR_IF(context == explicit_context && BLOCK_SIZE <= EXPLICIT_BLOCK_EMPTY_COUNTER_THRESHOLD)
                 {
                     // Check flags
@@ -1968,7 +2008,7 @@ namespace moodycamel
                 else
                 {
                     // Check counter
-                    // block 大小超过阈值，则需要根据原子变量来判断
+                    // block 大小超过阈值，则需要根据原子变量来判断（隐式队列也通过该变量来判断 block 是否为空）
                     if (elementsCompletelyDequeued.load(std::memory_order_relaxed) == BLOCK_SIZE)
                     {
                         std::atomic_thread_fence(std::memory_order_acquire);
@@ -1993,6 +2033,7 @@ namespace moodycamel
                 else
                 {
                     // Increment counter
+                    // 注意 fetch_add 的返回值为 +1 之前的值
                     auto prevVal = elementsCompletelyDequeued.fetch_add(1, std::memory_order_release);
                     assert(prevVal < BLOCK_SIZE);
                     return prevVal == BLOCK_SIZE - 1;
@@ -2075,17 +2116,27 @@ namespace moodycamel
 
         private:
             static_assert(std::alignment_of<T>::value <= sizeof(T), "The queue does not support types with an alignment greater than their size at this time");
+            // char 类型的数组，每个数组元素都是一个数据 T。这里指定了内存对齐方式：和 T 类型保持内存对齐
             MOODYCAMEL_ALIGNED_TYPE_LIKE(char[sizeof(T) * BLOCK_SIZE], T)
             elements;
 
-        public:
-            Block *next;
-            std::atomic<size_t> elementsCompletelyDequeued;                                                      // block 是否为空
-            std::atomic<bool> emptyFlags[BLOCK_SIZE <= EXPLICIT_BLOCK_EMPTY_COUNTER_THRESHOLD ? BLOCK_SIZE : 1]; // block 中每个元素是否为空的标志位
+            /***
+             * 如果用下面这种方式，则无法满足内存对齐的要求，造成性能下降。比如：
+             * T 类型指定内存对齐要求为 128 字节，如果用下面这种定义 elements 的方式，则 block 的内存对齐要求为 8 字节。
+             * 则 CPU 需要读取 16 次才能够读取到一个完整的 T 类型的数据，造成性能下降。
+             *
+             * 如果和 T 类型保持内存对齐，则 CPU 可以一次性读取 128 字节（即完整的 T 类型数据）
+             */
+            // char elements[sizeof(T) * BLOCK_SIZE];
 
         public:
-            std::atomic<std::uint32_t> freeListRefs;
-            std::atomic<Block *> freeListNext;
+            Block *next;
+            std::atomic<size_t> elementsCompletelyDequeued;                                                      // block 已出队元素的数量（用来判断 block 是否为空）
+            std::atomic<bool> emptyFlags[BLOCK_SIZE <= EXPLICIT_BLOCK_EMPTY_COUNTER_THRESHOLD ? BLOCK_SIZE : 1]; // block 中每个元素是否为空的标志位（仅显式队列使用）
+
+        public:
+            std::atomic<std::uint32_t> freeListRefs;// 引用计数，避免 ABA 问题
+            std::atomic<Block *> freeListNext;      // 作为 freeListNode 的元素：指向下一个 block 的指针
             std::atomic<bool> shouldBeOnFreeList;
             bool dynamicallyAllocated; // Perhaps a better name for this would be 'isNotPartOfInitialBlockPool'
 
@@ -2093,6 +2144,8 @@ namespace moodycamel
             void *owner;
 #endif
         };
+
+        // 这里要求 block 必须要和封装的类型 T 保持内存对齐（必须要大于 T 类型的内存对齐要求）
         static_assert(std::alignment_of<Block>::value >= std::alignment_of<T>::value, "Internal error: Blocks must be at least as aligned as the type they are wrapping");
 
 #ifdef MCDBGQ_TRACKMEM
@@ -3012,6 +3065,7 @@ namespace moodycamel
                         block = get_block_index_entry_for_index(index)->value.load(std::memory_order_relaxed);
                     }
 
+                    // 析构 block 的每一个 slot 中的元素（就是入队的时候 new 出来的对象）
                     ((*block)[index])->~T();
                     ++index;
                 }
@@ -3027,6 +3081,8 @@ namespace moodycamel
                 auto localBlockIndex = blockIndex.load(std::memory_order_relaxed);
                 if (localBlockIndex != nullptr)
                 {
+                    // 因为每次创建 block index 的时候，都将上一个 block index 的 index 部分全部重新映射到了新建 block index 的 index 里面（这点得益于每次新建的 block index 的 index 容量是上一个 block index 中 index 的两倍）
+                    // 所以可以在 localBlockIndex 中执行所有 block index 中 entry 的析构函数
                     for (size_t i = 0; i != localBlockIndex->capacity; ++i)
                     {
                         localBlockIndex->index[i]->~BlockIndexEntry();
@@ -3044,7 +3100,7 @@ namespace moodycamel
             template <AllocationMode allocMode, typename U>
             inline bool enqueue(U &&element)
             {
-                // 需要注意的是：这里的 tailIndex 和 currentTailIndex 是不断递增的，但是在插入 block[currentTailIndex] 时并不会造成非法访问，原因见下：
+                // 需要注意的是：这里的 tailIndex 和 currentTailIndex 是不断递增的，但是在插入 block[currentTailIndex] 时并不会造成非法访问，原因可以参考block重载[]处代码注释
                 index_t currentTailIndex = this->tailIndex.load(std::memory_order_relaxed);
                 index_t newTailIndex = 1 + currentTailIndex;
                 if ((currentTailIndex & static_cast<index_t>(BLOCK_SIZE - 1)) == 0)
@@ -3071,7 +3127,8 @@ namespace moodycamel
                     auto newBlock = this->parent->ConcurrentQueue::template requisition_block<allocMode>();
                     if (newBlock == nullptr)
                     {
-                        // block pool 已经用完并且申请内存失败，可以重用之前 entry 指向的 block，但是这里就需要重置 block tail（将 entries 作为一个 entry 的循环数组）
+                        // block pool 已经用完并且尝试从内存中申请新的 block 失败，且 freelist 没有可用 block
+                        // 可以重用之前 entry 指向的 block，但是这里就需要重置 block tail（即 block index 中的最后一个 entry 被重用）
                         rewind_block_index_tail();
                         idxEntry->value.store(nullptr, std::memory_order_relaxed);
                         return false;
@@ -3129,14 +3186,29 @@ namespace moodycamel
                 // 注意这里关于出队的特殊处理！！！
                 index_t tail = this->tailIndex.load(std::memory_order_relaxed);
                 index_t overcommit = this->dequeueOvercommit.load(std::memory_order_relaxed);
+                // 可能有多个消费者同时调用到这里，所以如果实际出队元素的数量小于 tailIndex，表示可能有元素可以出队（但并不一定所有消费者都可以消费到数据）
                 if (details::circular_less_than<index_t>(this->dequeueOptimisticCount.load(std::memory_order_relaxed) - overcommit, tail))
                 {
                     std::atomic_thread_fence(std::memory_order_acquire);
 
+                    // 递增乐观出队计数（注意：并不是实际的出队元素的数量）
                     index_t myDequeueCount = this->dequeueOptimisticCount.fetch_add(1, std::memory_order_relaxed);
+                    // 可能有生产者更新了 tailIndex，所以需要重新载入 tailIndex 的值
                     tail = this->tailIndex.load(std::memory_order_acquire);
+
+                    /**
+                     * myDequeueCount - overcommit 可以得到实际出队元素的数量
+                     * 如果出队的数量大于或者等于 tailIndex 的值，则出队失败
+                     *
+                     * 为什么要进行第二次判断：
+                     * 上面第一次判断，可能有多个消费者同时读取 tailIndex，并且每个线程都得到有元素可以出队的结论。
+                     * 但是考虑到线程执行出队操作的先后顺序，如果有某个线程在其他线程执行具体出队操作之前，
+                     * 已经将队列中的元素出队，并更新了 dequeueOptimisticCount，那么其他线程再出队就会造成错误，
+                     * 所以在 std::atomic_thread_fence 栅栏之后，需要进行第二次判断。
+                     **/
                     if ((details::likely)(details::circular_less_than<index_t>(myDequeueCount - overcommit, tail)))
                     {
+                        // 此时队列中肯定有一个元素可以出队
                         index_t index = this->headIndex.fetch_add(1, std::memory_order_acq_rel);
 
                         // Determine which block the element is in
@@ -3188,8 +3260,7 @@ namespace moodycamel
                                     debug::DebugLock lock(mutex);
 #endif
                                     // Add the block back into the global free pool (and remove from block index)
-                                    // 如果整个 block 为空，则将 entry 的 value 置为 nullptr
-                                    // 可能有其他的消费者仍然在使用该 block(比如计算偏移量)，所以这里没有直接从 block index 中删除 block，而是将 block 指针置为空
+                                    // 如果整个 block 为空，则将 entry 的 value 置为 nullptr，表明 enqueue 时申请的 new block 可以插入到该 entry
                                     entry->value.store(nullptr, std::memory_order_relaxed);
                                 }
                                 // 整个 block 为空，将 block 放入到 block pool 中
@@ -3524,6 +3595,11 @@ namespace moodycamel
             // The block size must be > 1, so any number with the low bit set is an invalid block base index
             static const index_t INVALID_BLOCK_BASE = 1;
 
+            /**
+             * 标志 entry 可用的两种表示方法：
+             * 1. 刚申请的 blockIndex，会将所有的 entry 的 key 初始化为 INVALID_BLOCK_BASE，表明当前 entry 可用，可以插入 block
+             * 2. 当 block 为空之后，会将 block 返回给 freelist，然后将指向该 block 的 entry 的 value 置为 nullptr。下次入队操作时，可以将 new block 插入该 entry
+             */
             struct BlockIndexEntry
             {
                 std::atomic<index_t> key;
@@ -3534,8 +3610,8 @@ namespace moodycamel
             {
                 size_t capacity;          // block index 的容量（实际上是 block index 中 entries 的数量，每一个 entry 都指向一个 block，每个 block 都有多个 slot，可以保存多个元素）
                 std::atomic<size_t> tail; // block index 中 entries 尾部（entries 是一个数组，每个元素都是一个 entry，tail 是最后一个 entry 的索引）
-                BlockIndexEntry *entries; // entries 可以看成一个数组，数组的每个元素都是 entry，每个 entry 是一个 KV 键值对，value 是 block 的指针
-                BlockIndexEntry **index;  // 指向 entries 的指针
+                BlockIndexEntry *entries; // entries 可以看成一个数组，数组的每个元素都是 entry，每个 entry 是一个 KV 键值对，value 是 block 的指针（block index 链表中的每个 block index 中的 entries 下标都是从0开始的）
+                BlockIndexEntry **index;  // 指向 entries 的指针（这里的 index 在多个 block index 组成的链表中是不断递增的，所以可以通过该 index 索引到不同 block 中的 entry）
                 BlockIndexHeader *prev;   // 多个 block index 会组成一个链表。该指针用来指向前一个 block index
             };
 
@@ -3550,6 +3626,11 @@ namespace moodycamel
                 }
                 size_t newTail = (localBlockIndex->tail.load(std::memory_order_relaxed) + 1) & (localBlockIndex->capacity - 1);
                 idxEntry = localBlockIndex->index[newTail];
+                /**
+                 * 两个条件判断：
+                 * 1. key == INVALID_BLOCK_BASE : 在 blockIndex 初始化的时候会将所有的 entry 的 key 初始化为该值，表明未使用
+                 * 2. value == nullptr : 该 entry 的 block 中元素全部出队，则会将 block 放入到 freelist 中，然后将指向该 block 的 entry 的 value 设置为 nullptr
+                 */
                 if (idxEntry->key.load(std::memory_order_relaxed) == INVALID_BLOCK_BASE ||
                     idxEntry->value.load(std::memory_order_relaxed) == nullptr)
                 {
@@ -3571,6 +3652,8 @@ namespace moodycamel
                 {
                     return false;
                 }
+
+                // 这部分处理逻辑是在 new_block_index 返回为 true 之后执行的
                 localBlockIndex = blockIndex.load(std::memory_order_relaxed);
                 newTail = (localBlockIndex->tail.load(std::memory_order_relaxed) + 1) & (localBlockIndex->capacity - 1);
                 idxEntry = localBlockIndex->index[newTail];
@@ -3586,9 +3669,12 @@ namespace moodycamel
                 localBlockIndex->tail.store((localBlockIndex->tail.load(std::memory_order_relaxed) - 1) & (localBlockIndex->capacity - 1), std::memory_order_relaxed);
             }
 
+            // 通过 index 索引到对应的 entry
+            // 入参 index : headIndex_ 或者 tailIndex_（即入队或者出队索引）
             inline BlockIndexEntry *get_block_index_entry_for_index(index_t index) const
             {
                 BlockIndexHeader *localBlockIndex;
+                // 通过 block 中的 index(即入参)计算出该 index 对应着 block index 中的哪一个 index
                 auto idx = get_block_index_index_for_index(index, localBlockIndex);
                 return localBlockIndex->index[idx];
             }
@@ -3605,6 +3691,7 @@ namespace moodycamel
                 assert(tailBase != INVALID_BLOCK_BASE);
                 // Note: Must use division instead of shift because the index may wrap around, causing a negative
                 // offset, whose negativity we want to preserve
+                // 计算当前 index 属于哪个 block
                 auto offset = static_cast<size_t>(static_cast<typename std::make_signed<index_t>::type>(index - tailBase) / BLOCK_SIZE);
                 size_t idx = (tail + offset) & (localBlockIndex->capacity - 1);
                 assert(localBlockIndex->index[idx]->key.load(std::memory_order_relaxed) == index && localBlockIndex->index[idx]->value.load(std::memory_order_relaxed) != nullptr);
@@ -3614,6 +3701,7 @@ namespace moodycamel
             bool new_block_index()
             {
                 auto prev = blockIndex.load(std::memory_order_relaxed);
+
                 // 第二次创建 block index 时，prev 指针不为空
                 // prevCapacity: 上一次创建的 block index 的 capacity
                 size_t prevCapacity = prev == nullptr ? 0 : prev->capacity;
@@ -3632,8 +3720,7 @@ namespace moodycamel
                 auto index = reinterpret_cast<BlockIndexEntry **>(details::align_for<BlockIndexEntry *>(reinterpret_cast<char *>(entries) + sizeof(BlockIndexEntry) * entryCount));
 
                 // 非第一次创建 block index
-                // 把上一次创建的 block index 的 index 中的内容移动到这一次创建的 block index 里面的 index 部分
-                // TODO：只移动了 index 部分，entries 部分并未移动，这么做的目的是什么？？
+                // 把上一次创建的 block index 的 index 中的内容移动到新创建的 block index 里面的 index 部分（第二次创建的 block index 中的 index 容量是旧的 block index 中的 index 容量的两倍）。这样就可以在新的 block index 中仍然可以索引到老的 block index 中的 entry
                 if (prev != nullptr)
                 {
                     auto prevTail = prev->tail.load(std::memory_order_relaxed);
@@ -3654,6 +3741,7 @@ namespace moodycamel
                     entries[i].key.store(INVALID_BLOCK_BASE, std::memory_order_relaxed);
                     // 注意这里做 index 和 entry 的指针映射：跳过了上一次创建的 block index 的 index 部分
                     // （虽然将上一次创建的 block index 的 index 部分移动到了这一次创建的 block index 里面，但是指针指向关系没改变）
+                    // 多个 block index 组成的链表中，entry 的下标在不同的 block index 都是从 0 开始的，但是 index 的下标是一直递增的
                     index[prevCapacity + i] = entries + i;
                 }
 
@@ -3669,6 +3757,9 @@ namespace moodycamel
                 // 左移 *2
                 // 右移 /2
                 // 每次新创建 block index，其 capacity 为上一次创建 block index 的两倍
+                // 实际上是 block index 中的 index 为原来的两倍，这么做的原因是在创建了新的 block index 之后，将旧的 block index 中的 index 指针映射到新的 blockIndex 中的 index
+                // 这样就可以在新的 block index 中索引到老的 block index 中的 entry
+                // 同样的，这种设计也有利于 block index 析构：只在当前的 block index 就可以完成所有block index 中 entry 的析构（具体参考析构函数的实现机制）
                 nextBlockIndexCapacity <<= 1;
 
                 return true;
@@ -3713,6 +3804,7 @@ namespace moodycamel
                 return;
             }
 
+            // block pool 的每一个元素都是 block（释放 block pool 的时候需要先析构每一个 block，然后才能释放内存）
             initialBlockPool = create_array<Block>(blockCount);
             if (initialBlockPool == nullptr)
             {
@@ -4435,7 +4527,7 @@ namespace moodycamel
         std::atomic<ProducerBase *> producerListTail; // 生产者链表的 tail（所有的生产者是用 free-list 方式组织起来的）
         std::atomic<std::uint32_t> producerCount;     // 生产者数量
 
-        std::atomic<size_t> initialBlockPoolIndex;
+        std::atomic<size_t> initialBlockPoolIndex;     // block pool 维护的 index。入队操作从 block pool 中申请 block 的时候需要用到这个 index
         Block *initialBlockPool;
         size_t initialBlockPoolSize;
 

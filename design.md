@@ -49,7 +49,7 @@ blockIndex 中的 entries 是一个数组，其数组的每一个元素都是 `B
 
 入队操作时，读取 tailIndex 的值，tailIndex 表示下一个即将入队的 slot，判断是否到达当前 block 的末尾（即判断当前 block 是否已满）。如果未满，直接在该 block 入队，并更新 tailIndex；如果当前 block 已满，需要从 block pool 中申请新的 newBlock，插入到 block index 中，在 newBlock 中进行入队操作，并更新 tailIndex、 tailBlock 以及 tail。tailIndex 总是增加（除非溢出或者环绕），入队操作只有一个线程在更新对应的变量。
 
-出队操作时，读取 headIndex，headIndex 表示即将出队的 slot，通过 headIndex 计算得到对应的 entry，然后可以得到出队的 block。对 headIndex 的元素出队之后，更新 headIndex。当 block 中的最后一个元素出队之后，需要将该 block 从 block index 中删除（但是由于另一个消费者可能仍然在使用这个 block，比如计算偏移量，所以并没有直接从 block index 中删除该 block，但是 block 指针被置为空，表明当前这个 entries 的 slot 可以被重用），并将该 block 返回给 block pool。出队操作可能是并发的，所以 headIndex 由多个消费者进行原子性的递增。
+出队操作时，读取 headIndex，headIndex 表示即将出队的 slot，通过 headIndex 计算得到对应的 entry，然后可以得到出队的 block。对 headIndex 的元素出队之后，更新 headIndex。当 block 中的最后一个元素出队之后，会将该 block 返回给 free list。然后将指向该 block 的 entry 的 value 置为 `nullptr`，入队操作就可以重用该 entry。出队操作可能是并发的，所以 headIndex 由多个消费者进行原子性的递增。
 
 预期之内的情况是，headIndex 和 tailIndex 最终会溢出。
 
@@ -57,11 +57,33 @@ blockIndex 中的 entries 是一个数组，其数组的每一个元素都是 `B
 
 另一方面，如果 `dequeueOptimisticCount` 增加后超过（或等于）tailIndex 的值（说明已经有其他线程将队列中的所有元素全部出队），则出队操作会失败。此时可以通过递减 dequeueOptimisticCount 的值以使它最终与队列计数保持一致，但是为了增加并行性并保持所有涉及到的变量单调递增，这里选择增加 `dequeueOvercommit` 计数器。可以通过 `dequeueOptimisticCount` 减去 `dequeueOvercommit` 的值最终得到我们想要的实际出队的元素数量。
 
+block index 的生命周期由 producer 来管理。当 producer 析构的时候，会先析构 block 的 slot 中的元素，然后析构 block index 的每一个 entry 和 header，最后释放整个 block index 的内存。
+
 ### block pool
 
 concurrentqueue 的 block pool 有两种不同的表现形式：数组和链表。在 concurrentqueue 的构造函数中，它是按照 block count 预先分配的初始数组。在入队操作时，每次申请 block 都是从这个初始数组中进行分配，一旦数组内存消耗殆尽，这个 block pool 将永远空着。在出队操作的时候，当某个 block 中的元素全部出队，即 block 为空的时候，会将 block 返回给 free-list，free-list 是一个 lock-free 的单链表（不是 wait-free 的）。free-list 管理的 block 是可以被重用的，入队操作申请 block 之前会优先去重用 free-list 中的 block。
 
+数组形式的 block pool 结构如下：
+
+![block pool 数组形式](./images/mpmc-block-pool.png)
+
+数组的每个元素都是一个 block。每次入队时，都会从该 block pool 中尝试分配 block。如果分配失败，会尝试其他途径。
+
+链表形式的 block pool 结构如下：
+
+![free list 结构](./images/mpmc-free-list.png)
+
+block 为空的判断方式：
+
+* 隐式队列：通过比较原子变量 `elementsCompletelyDequeued` 和 BLOCK_SIZE 是否相等，判断该 Block 是否为空
+
+* 显式队列：使用了两种方式来判断 block 是否为空。1）当 BLOCK_SIZE 没有超过阈值时，通过遍历 block 中每个元素的标志位 flag 来判断 block 是否为空；2）超过阈值时，通过比较原子变量 `elementsCompletelyDequeued` 和 BLOCK_SIZE 是否相等，来判断 Block 是否为空。
+
+concurrentqueue 使用了 free-list 来管理空 block。当 block 为空时，会将 blocK 添加到 free-list 里面；元素入队时，会优先重用 free-list 里面的 block。free-list 的插入和删除都是从头部开始的。
+
 free-list 避免 ABA 问题：https://moodycamel.com/blog/2014/solving-the-aba-problem-for-lock-free-free-lists.htm
+
+block pool 的生命周期由 concurrentqueue 来管理，当 concurrentqueue 被析构时，会销毁 block pool 中的每一个 block 对象，然后释放整个 block pool 的内存。
 
 ## 显式生产者队列
 
