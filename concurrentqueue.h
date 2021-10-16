@@ -1808,8 +1808,8 @@ namespace moodycamel
              *
              * try_get() 方法中，一旦引用计数为 0，则不应该再增加，在开始将 node 添加到 freelist 的过程中，不应该再增加引用计数。要解决这个问题，我们首选要确保如果节点在列表中，引用计数永远不为 0.
              */
-            std::atomic<std::uint32_t> freeListRefs;    // 引用计数：避免 ABA 问题
-            std::atomic<N *> freeListNext;              // 指向下一个 node 的指针
+            std::atomic<std::uint32_t> freeListRefs; // 引用计数：避免 ABA 问题
+            std::atomic<N *> freeListNext;           // 指向下一个 node 的指针
         };
 
         // A simple CAS-based lock-free free list. Not the fastest thing in the world under heavy contention, but
@@ -1953,8 +1953,8 @@ namespace moodycamel
             // Implemented like a stack, but where node order doesn't matter (nodes are inserted out of order under contention)
             std::atomic<N *> freeListHead;
 
-            static const std::uint32_t REFS_MASK = 0x7FFFFFFF;                  // 引用计数的掩码
-            static const std::uint32_t SHOULD_BE_ON_FREELIST = 0x80000000;      // 标记当前 node 应该被放入 free list
+            static const std::uint32_t REFS_MASK = 0x7FFFFFFF;             // 引用计数的掩码
+            static const std::uint32_t SHOULD_BE_ON_FREELIST = 0x80000000; // 标记当前 node 应该被放入 free list
 
 #ifdef MCDBGQ_NOLOCKFREE_FREELIST
             debug::DebugMutex mutex;
@@ -2135,8 +2135,8 @@ namespace moodycamel
             std::atomic<bool> emptyFlags[BLOCK_SIZE <= EXPLICIT_BLOCK_EMPTY_COUNTER_THRESHOLD ? BLOCK_SIZE : 1]; // block 中每个元素是否为空的标志位（仅显式队列使用）
 
         public:
-            std::atomic<std::uint32_t> freeListRefs;// 引用计数，避免 ABA 问题
-            std::atomic<Block *> freeListNext;      // 作为 freeListNode 的元素：指向下一个 block 的指针
+            std::atomic<std::uint32_t> freeListRefs; // 引用计数，避免 ABA 问题
+            std::atomic<Block *> freeListNext;       // 作为 freeListNode 的元素：指向下一个 block 的指针
             std::atomic<bool> shouldBeOnFreeList;
             bool dynamicallyAllocated; // Perhaps a better name for this would be 'isNotPartOfInitialBlockPool'
 
@@ -3128,7 +3128,12 @@ namespace moodycamel
                     if (newBlock == nullptr)
                     {
                         // block pool 已经用完并且尝试从内存中申请新的 block 失败，且 freelist 没有可用 block
-                        // 可以重用之前 entry 指向的 block，但是这里就需要重置 block tail（即 block index 中的最后一个 entry 被重用）
+                        // 重用 block index 中最后一个 block。所以需要重置 block tail
+                        /**
+                         * 重用最后一个 block 的原因：
+                         * 1. 如果从 block index 开头重新覆盖之前的数据，会导致队列中的所有数据不可用（乱序）
+                         * 2. 如果只覆盖最后一个 block 的数据，最起码可以保证队列中前面所有数据是正常的，也可以保证入队操作能够正常进行
+                         */
                         rewind_block_index_tail();
                         idxEntry->value.store(nullptr, std::memory_order_relaxed);
                         return false;
@@ -4527,7 +4532,7 @@ namespace moodycamel
         std::atomic<ProducerBase *> producerListTail; // 生产者链表的 tail（所有的生产者是用 free-list 方式组织起来的）
         std::atomic<std::uint32_t> producerCount;     // 生产者数量
 
-        std::atomic<size_t> initialBlockPoolIndex;     // block pool 维护的 index。入队操作从 block pool 中申请 block 的时候需要用到这个 index
+        std::atomic<size_t> initialBlockPoolIndex; // block pool 维护的 index。入队操作从 block pool 中申请 block 的时候需要用到这个 index
         Block *initialBlockPool;
         size_t initialBlockPoolSize;
 
