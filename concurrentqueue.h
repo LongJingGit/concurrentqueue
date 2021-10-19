@@ -2117,8 +2117,18 @@ namespace moodycamel
         private:
             static_assert(std::alignment_of<T>::value <= sizeof(T), "The queue does not support types with an alignment greater than their size at this time");
             // char 类型的数组，每个数组元素都是一个数据 T。这里指定了内存对齐方式：和 T 类型保持内存对齐
+            // sizeof(Block) 为 sizeof(T) 大小的整数倍
             MOODYCAMEL_ALIGNED_TYPE_LIKE(char[sizeof(T) * BLOCK_SIZE], T)
             elements;
+
+            /**
+             * 指定内存对齐方式，会影响 create block 时申请的内存大小
+             */
+
+            /**
+             * 内存对齐知识补充：
+             * 1. 如果指定的内存对齐为 sizeof(T)，则 CPU 会从地址为 sizeof(T) 的倍数的内存地址开始读取数据。比如，sizeof(T) == 8，则CPU从 0x08 0x10 0x18 0x20 这些地址读取数据
+             */
 
             /***
              * 如果用下面这种方式，则无法满足内存对齐的要求，造成性能下降。比如：
@@ -3127,13 +3137,8 @@ namespace moodycamel
                     auto newBlock = this->parent->ConcurrentQueue::template requisition_block<allocMode>();
                     if (newBlock == nullptr)
                     {
-                        // block pool 已经用完并且尝试从内存中申请新的 block 失败，且 freelist 没有可用 block
-                        // 重用 block index 中最后一个 block。所以需要重置 block tail
-                        /**
-                         * 重用最后一个 block 的原因：
-                         * 1. 如果从 block index 开头重新覆盖之前的数据，会导致队列中的所有数据不可用（乱序）
-                         * 2. 如果只覆盖最后一个 block 的数据，最起码可以保证队列中前面所有数据是正常的，也可以保证入队操作能够正常进行
-                         */
+                        // block pool 已经用完并且尝试从内存中申请新的 block 失败，且 freelist 没有可用 block（或者用户调用了 try_enqueue：不允许自主分配内存）
+                        // 则会回退 block index 的 tail
                         rewind_block_index_tail();
                         idxEntry->value.store(nullptr, std::memory_order_relaxed);
                         return false;
@@ -3177,7 +3182,7 @@ namespace moodycamel
                  * 需要注意的是，这里的 currentTailIndex 是不断递增的，但是每个 block 的的 BLOCK_SIZE 是固定的，为什么这里没有溢出？
                  * 因为 block 对 下标访问运算符[] 做了重载，所以只需要移动 tailBlock 的指针即可。
                  * 具体重载方式可以参考 block 对 下标访问运算符 做重载处的代码注释或者 tailIndex 和 headIndex 定义处的说明
-                 * */
+                 **/
                 new ((*this->tailBlock)[currentTailIndex]) T(std::forward<U>(element));
 
                 this->tailIndex.store(newTailIndex, std::memory_order_release);
@@ -3629,12 +3634,16 @@ namespace moodycamel
                 {
                     return false; // this can happen if new_block_index failed in the constructor
                 }
+
+                // 向前推进 tail
                 size_t newTail = (localBlockIndex->tail.load(std::memory_order_relaxed) + 1) & (localBlockIndex->capacity - 1);
                 idxEntry = localBlockIndex->index[newTail];
                 /**
                  * 两个条件判断：
                  * 1. key == INVALID_BLOCK_BASE : 在 blockIndex 初始化的时候会将所有的 entry 的 key 初始化为该值，表明未使用
-                 * 2. value == nullptr : 该 entry 的 block 中元素全部出队，则会将 block 放入到 freelist 中，然后将指向该 block 的 entry 的 value 设置为 nullptr
+                 * 2. value == nullptr :
+                 *      2.1 该 entry 的 block 中元素全部出队，则会将 block 放入到 freelist 中，然后将指向该 block 的 entry 的 value 设置为 nullptr
+                 *      2.2 入队操作时 block pool 中没有可用的 block，且没法进行内存分配（申请内存失败或者用户指定不可自主分配内存），则会将 entry 的 value 设置为 nullptr
                  */
                 if (idxEntry->key.load(std::memory_order_relaxed) == INVALID_BLOCK_BASE ||
                     idxEntry->value.load(std::memory_order_relaxed) == nullptr)
@@ -3643,6 +3652,7 @@ namespace moodycamel
                     idxEntry->key.store(blockStartIndex, std::memory_order_relaxed);
                     // 更新 block index 的 entries 的 tail
                     // 需要注意的是，当 block index 中的某一个 entry 的 block 填满之后，会去申请下一个 block，并和 block index 的下一个 entry 关联起来
+                    // 注意：如果内存不足或者用户指定了不允许自主分配内存，则入队操作会失败，会在 rewind_block_index_tail 接口中回退该 tail
                     localBlockIndex->tail.store(newTail, std::memory_order_release);
                     return true;
                 }
@@ -3668,6 +3678,7 @@ namespace moodycamel
                 return true;
             }
 
+            // 回退 tail
             inline void rewind_block_index_tail()
             {
                 auto localBlockIndex = blockIndex.load(std::memory_order_relaxed);
@@ -4456,6 +4467,7 @@ namespace moodycamel
         // Utility functions
         //////////////////////////////////
 
+        // 考虑了内存对齐，所以这里返回的内存地址的指针肯定是符合 (ptr % std::alignment_of<TAlign>::value == 0) 的内存地址。同样的，每个元素的内存地址都是符合这个要求的
         template <typename TAlign>
         static inline void *aligned_malloc(size_t size)
         {
