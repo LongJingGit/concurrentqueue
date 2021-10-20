@@ -3038,7 +3038,6 @@ namespace moodycamel
                                                          blockIndex(nullptr)
             {
                 // 创建 block index
-                createBlockIndexCount() = 0;
                 new_block_index();
             }
 
