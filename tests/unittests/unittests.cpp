@@ -461,25 +461,23 @@ namespace moodycamel
     public:
         ConcurrentQueueTests()
         {
-            // REGISTER_TEST(create_empty_queue);
-            // REGISTER_TEST(create_token);
-            // REGISTER_TEST(circular_less_than);
-            // REGISTER_TEST(enqueue_one_explicit);
-            // REGISTER_TEST(enqueue_and_dequeue_one_explicit);
-            // REGISTER_TEST(enqueue_one_implicit);
-            // REGISTER_TEST(enqueue_and_dequeue_one_implicit);
-            // REGISTER_TEST(enqueue_and_dequeue_a_few);
-            // REGISTER_TEST(enqueue_bulk);
-            // REGISTER_TEST(block_alloc);
-            // REGISTER_TEST(token_move);
-            // REGISTER_TEST(multi_producers);
-            // REGISTER_TEST(producer_reuse);
-            // REGISTER_TEST(block_reuse);
-            // REGISTER_TEST(block_recycling);
-            // REGISTER_TEST(leftovers_destroyed);
-
+            REGISTER_TEST(create_empty_queue);
+            REGISTER_TEST(create_token);
+            REGISTER_TEST(circular_less_than);
+            REGISTER_TEST(enqueue_one_explicit);
+            REGISTER_TEST(enqueue_and_dequeue_one_explicit);
+            REGISTER_TEST(enqueue_one_implicit);
+            REGISTER_TEST(enqueue_and_dequeue_one_implicit);
+            REGISTER_TEST(enqueue_and_dequeue_a_few);
+            REGISTER_TEST(enqueue_bulk);
+            REGISTER_TEST(block_alloc);
+            REGISTER_TEST(token_move);
+            REGISTER_TEST(multi_producers);
+            REGISTER_TEST(producer_reuse);
+            REGISTER_TEST(block_reuse);
+            REGISTER_TEST(block_recycling);
+            REGISTER_TEST(leftovers_destroyed);
             REGISTER_TEST(block_index_resized);
-#if 0
             REGISTER_TEST(try_dequeue);
             REGISTER_TEST(try_dequeue_threaded);
             REGISTER_TEST(try_dequeue_bulk);
@@ -512,7 +510,6 @@ namespace moodycamel
 
             REGISTER_TEST(explicit_strings_threaded);
             REGISTER_TEST(large_traits);
-#endif
         }
 
         bool postTest(bool testSucceeded) override
