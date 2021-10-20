@@ -3038,6 +3038,7 @@ namespace moodycamel
                                                          blockIndex(nullptr)
             {
                 // 创建 block index
+                createBlockIndexCount() = 0;
                 new_block_index();
             }
 
@@ -3714,6 +3715,7 @@ namespace moodycamel
                 return idx;
             }
 
+            // new block index 的逻辑可以参考 unittest.cpp 中 block_index_resized 测试用例的解释说明
             bool new_block_index()
             {
                 auto prev = blockIndex.load(std::memory_order_relaxed);
