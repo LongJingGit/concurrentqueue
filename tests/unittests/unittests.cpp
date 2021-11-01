@@ -3743,6 +3743,18 @@ namespace moodycamel
             // A simple test that exercises the full public API (just to make sure every function is implemented
             // and works on at least the most basic level)
 
+            /**
+             * @brief
+             * 什么时候调用拷贝构造函数？什么时候调用移动构造函数？
+             * 1. 当类中同时含有拷贝构造和移动构造函数时，如果使用临时对象初始化当前类对象，编译器会优先调用移动构造函数；只有当类中没有适当的移动构造函数时，编译器才会退而求其次，调用拷贝构造函数。
+             * 2. 在实际开发中，通常在类中自定义移动构造函数的同时，会再为其自定义一个适当的拷贝构造函数，由此当用户利用右值初始化类对象时，会调用移动构造函数；使用左值（非右值）初始化类对象时，会调用拷贝构造函数。
+             * 3. 在使用左值（非右值）初始化类对象时，可以使用 std::move 将左值转换为右值，从而调用移动构造函数
+             *
+             * 非 const 右值引用只能操作右值。
+             *
+             * 右值：函数返回值、lambda 表达式、临时对象都是右值（没有名称也无法获取存储地址）
+             */
+
             // enqueue(T const&)
             {
                 ConcurrentQueue<Copyable, Traits> q;
@@ -4265,6 +4277,8 @@ namespace moodycamel
                 {
                     ConcurrentQueue<int, MallocTrackingTraits> temp;
                     temp = std::move(q1);
+                    ASSERT_OR_FAIL(temp.size_approx() == 5678);
+                    ASSERT_OR_FAIL(q1.size_approx() == 0);
                     q1 = std::move(q2);
                     q2 = std::move(temp);
                 }
